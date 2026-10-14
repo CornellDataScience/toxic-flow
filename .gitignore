@@ -225,3 +225,10 @@ data/
 *.csv
 *.gz
 .env
+
+# secrets: real credentials live only in .env (see .env.example)
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
