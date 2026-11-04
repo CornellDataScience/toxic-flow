@@ -228,7 +228,7 @@ data/
 
 # secrets: real credentials live only in .env (see .env.example)
 .env.*
-!.env.example
+!.env.example/
 *.pem
 *.key
 secrets/
