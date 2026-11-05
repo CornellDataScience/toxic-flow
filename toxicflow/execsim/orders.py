@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import Enum
 
+from toxicflow.kraken.book import CHECKSUM_LEVELS
+
 from .models import EndReason, Evidence, FillCandidate, OrderIntent, PlacementRequest, Side, SkipReason
 from .queue_tracker import QueueTracker
 
@@ -75,6 +77,14 @@ class SimulatedOrder:
     @property
     def censored(self) -> bool:
         return self.end_reason is not None and self.end_reason.censored
+
+    @property
+    def checksum_covered(self) -> bool | None:
+        """False if our level was ever ranked beyond the checksummed top levels (§6.8, §11.2):
+        its queue was then not validated by Kraken's checksum. None if never placed."""
+        if self.inserted_ts is None:
+            return None
+        return self.max_level_rank <= CHECKSUM_LEVELS
 
     def start(
         self,

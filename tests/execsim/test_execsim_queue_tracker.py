@@ -143,13 +143,24 @@ def test_delete_at_front_is_a_level_candidate_with_full_volume():  # scenario 6
                                                                          (3, 0), 3000)
 
 
-def test_reductions_behind_us_while_queue_ahead_are_fifo_anomalies():  # scenario 7
+def test_reductions_behind_us_while_queue_ahead_are_not_candidates():  # scenario 7
     m = standard()
     t = m.track(BUY, "100.0")
     m.feed(t, bids=[order("B4", "100.0", "7.0", "add")])
-    assert m.feed(t, bids=[order("B4", "100.0", "5.0", "modify")]) == []
-    assert m.feed(t, bids=[order("B4", "100.0", "5.0", "delete")]) == []
-    assert t.diag["fifo_anomaly"] == 2 and t.ahead_qty == D("3.0")
+    assert m.feed(t, bids=[order("B4", "100.0", "5.0", "modify")]) == []  # partial, at the touch
+    assert m.feed(t, bids=[order("B4", "100.0", "5.0", "delete")]) == []  # full removal: likely a cancel
+    assert t.diag["behind_reduction"] == 2 and t.ahead_qty == D("3.0")
+    assert t.diag["fifo_anomaly"] == 1  # only the partial reduction contradicts FIFO
+
+
+def test_behind_reductions_away_from_touch_are_not_fifo_anomalies():
+    m = Market(bids=[order("B1", "100.0", "1.0"), order("C1", "99.9", "1.0")], asks=[order("A1", "100.2", "3.0")])
+    t = m.track(BUY, "99.9")
+    m.feed(t, bids=[order("C2", "99.9", "2.0", "add")])
+    assert m.feed(t, bids=[order("C2", "99.9", "1.0", "modify")]) == []  # best bid is 100.0
+    assert m.feed(t, bids=[order("C2", "99.9", "1.0", "delete")]) == []
+    assert (t.diag["behind_reduction"], t.diag["fifo_anomaly"]) == (2, 0)
+    assert list(t.ahead_ids) == ["C1"]
 
 
 def test_unrelated_levels_and_opposite_side_do_not_move_the_queue():
@@ -211,6 +222,28 @@ def test_cross_arrival_buy_and_sell():  # scenario 12
     out_buy, out_sell = m.feed([buy, sell], bids=[order("B7", "100.1", "0.3", "add")])
     assert out_buy == [] and [x.volume for x in out_sell] == [D("0.3")]
     assert m.feed(buy, asks=[order("A3", "100.2", "1.0", "add")]) == []  # does not cross
+
+
+def test_repeated_crossing_arrivals_are_distinct_events():
+    m = standard()
+    t = m.track(BUY, "100.1")
+    out = [m.feed(t, asks=[order("A2", "100.1", "0.2", "add")]),
+           m.feed(t, asks=[order("A3", "100.0", "0.4", "add")]),
+           m.feed(t, asks=[order("A2", "100.1", "0.2", "delete")]),
+           m.feed(t, asks=[order("A2", "100.1", "0.3", "add")])]  # same ID back after a delete: a new add
+    assert [[(r.volume, r.ref) for r in reaches] for reaches in out] == [
+        [(D("0.2"), (1, 0))], [(D("0.4"), (2, 0))], [], [(D("0.3"), (4, 0))]]
+
+
+def test_readd_of_order_already_crossing_is_not_counted_twice():
+    m = standard()
+    t = m.track(BUY, "100.1")
+    assert [r.volume for r in m.feed(t, asks=[order("A2", "100.0", "0.2", "add")])] == [D("0.2")]
+    assert m.feed(t, asks=[order("A2", "100.1", "0.5", "add")]) == []  # re-add while still resting
+    assert t.diag["cross_readd"] == 1
+    # an order that rested elsewhere and now moves through our price is new crossing liquidity
+    m.feed(t, asks=[order("A9", "100.4", "1.0", "add")])
+    assert [r.volume for r in m.feed(t, asks=[order("A9", "100.1", "1.0", "add")])] == [D("1.0")]
 
 
 def test_cross_arrival_with_queue_ahead_is_not_claimed():

@@ -1,8 +1,7 @@
 """Enums and value types shared by the simulator components (design §8.2).
 
 All prices and quantities are Decimal; all times are integer nanoseconds.
-BookEvent, ApplyInfo and SyncStatus live in sim_book.py. The strategy-facing
-BookView is not built yet.
+BookEvent, ApplyInfo and SyncStatus live in sim_book.py.
 """
 
 from dataclasses import dataclass
@@ -94,6 +93,37 @@ class OrderIntent:
 @dataclass(frozen=True, slots=True)
 class Skip:
     reason: SkipReason
+
+
+@dataclass(frozen=True, slots=True)
+class LevelSummary:
+    price: Decimal
+    qty: Decimal
+    n_orders: int
+
+
+@dataclass(frozen=True, slots=True)
+class BookView:
+    """Everything a strategy may see: an immutable copy of the top of the book at a decision boundary."""
+
+    symbol: str
+    ts_ns: int  # the decision time; the view holds only items with timestamp < ts_ns
+    tick: Decimal
+    bids: tuple[LevelSummary, ...]  # best first, top view_depth levels
+    asks: tuple[LevelSummary, ...]
+    book_timestamp: str | None = None  # raw item timestamp of the last item applied (for audits)
+
+    @property
+    def best_bid(self) -> Decimal | None:
+        return self.bids[0].price if self.bids else None
+
+    @property
+    def best_ask(self) -> Decimal | None:
+        return self.asks[0].price if self.asks else None
+
+    def best(self, side: Side) -> Decimal | None:
+        """Best bid for BUY, best ask for SELL: the price that side would join."""
+        return self.best_bid if side is Side.BUY else self.best_ask
 
 
 @dataclass(frozen=True, slots=True)

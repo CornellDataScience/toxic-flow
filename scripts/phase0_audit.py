@@ -24,7 +24,6 @@ import math
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
@@ -32,18 +31,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # import toxicflow
 
 from toxicflow.execsim.reader import KIND_GAP, KIND_META, KIND_TRUNCATED, RecordingReader, book_items, list_files
 from toxicflow.execsim.sim_book import SimL3Book
+from toxicflow.execsim.timeutil import S
+from toxicflow.execsim.timeutil import parse_rfc3339_ns as parse_ts_ns
 from toxicflow.kraken.book import PairInfo
 from toxicflow.kraken.config import DATA_DIR
 
-S = 1_000_000_000
 HORIZONS_S = (10, 30, 60, 300)
-
-
-def parse_ts_ns(ts: str) -> int:
-    """'2026-10-18T02:06:55.103101894Z' -> integer ns since the epoch, without float rounding."""
-    base, _, frac = ts.rstrip("Z").partition(".")
-    secs = int(datetime.strptime(base, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc).timestamp())
-    return secs * S + int(frac.ljust(9, "0")[:9])
 
 
 def pct(values: list, p: float):

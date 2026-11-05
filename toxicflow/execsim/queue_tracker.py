@@ -15,6 +15,20 @@ Two outputs are kept apart on purpose:
 
 The engine must pass only events from items whose checksum passed (R8), in
 stream order, and must end the order on any discontinuity (§7.3).
+
+Diagnostic counters (`diag`) never change the queue or candidacy:
+
+    behind_reduction    a reduction behind us at our price while orders are
+                        still ahead; ordinarily a cancel
+    fifo_anomaly        the subset that is a partial reduction at the touch,
+                        which would be an execution out of FIFO order (§6.5.1)
+    ahead_increase      same-price qty increase of an order ahead (row 1c)
+    ahead_requeued      an order ahead re-added or moved price (row 1d)
+    ahead_qty_mismatch  tracked qty differs from the event's prior qty (I3)
+    cross_with_ahead    crossing arrival while orders are still ahead (no candidate)
+    cross_readd         re-add of an order already resting through our price
+                        (same liquidity; no second candidate)
+    events_after_invalid  events ignored after invalidation
 """
 
 from collections import Counter
@@ -156,10 +170,14 @@ class QueueTracker:
         p = ev.price_before
         if self.side.better(p, self.price):
             return None  # row 5: priced ahead of us
-        if p == self.price and self.ahead_ids:
-            self.diag["fifo_anomaly"] += 1  # row 4: behind us while someone is still ahead
-            return None
         best_before = ev.best_bid_before if ev.side == "bids" else ev.best_ask_before
+        if p == self.price and self.ahead_ids:
+            # row 4: behind us while someone is still ahead. Usually an ordinary cancel; only a
+            # partial reduction at the touch (the "usually a fill" case, §6.5.2) contradicts FIFO.
+            self.diag["behind_reduction"] += 1
+            if ev.kind == "modify" and best_before == p:
+                self.diag["fifo_anomaly"] += 1
+            return None
         if best_before != p:
             return None  # row 6: executions happen only at the touch
         mechanism = Mechanism.LEVEL if p == self.price else Mechanism.INTERCEPT
@@ -168,8 +186,12 @@ class QueueTracker:
     def _cross_arrival(self, ev: BookEvent, item_ts_ns: int | None) -> ReachEvent | None:
         if ev.dropped_by_truncation or ev.qty_after is None:
             return None
-        crosses = ev.price <= self.price if self.side is Side.BUY else ev.price >= self.price
-        if not crosses:
+        if not self._crosses(ev.price):
+            return None
+        if ev.qty_before is not None and self._crosses(ev.price_before):
+            # re-add of an order that was already resting through our price: the same
+            # liquidity, already offered to us when it first arrived; never count it twice
+            self.diag["cross_readd"] += 1
             return None
         if self.ahead_ids:
             # a resting order that crosses our price means no historical order sat at it;
@@ -177,6 +199,10 @@ class QueueTracker:
             self.diag["cross_with_ahead"] += 1
             return None
         return ReachEvent(_ref(ev), item_ts_ns, ev.price, ev.qty_after, Mechanism.CROSS_ARRIVAL)
+
+    def _crosses(self, opposite_price: Decimal) -> bool:
+        """An opposite-side price at or through ours (ask <= our bid, bid >= our ask)."""
+        return opposite_price <= self.price if self.side is Side.BUY else opposite_price >= self.price
 
     # --- audit ------------------------------------------------------------
 

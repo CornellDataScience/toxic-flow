@@ -15,6 +15,7 @@ from enum import Enum
 
 from toxicflow.kraken.book import L3Book, PairInfo
 
+from .models import BookView, LevelSummary
 from .reader import StreamRecord
 
 BOOK_SIDES = ("bids", "asks")
@@ -247,6 +248,30 @@ class SimL3Book(L3Book):
 
     def level_qty(self, side: str, price: Decimal) -> Decimal:
         return sum(self.side(side).get(price, {}).values(), Decimal(0))
+
+    def level_rank(self, side: str, price: Decimal) -> int:
+        """1-based rank of `price` among the side's levels (1 = touch); for a price with no
+        orders, the rank a level there would have."""
+        return self.side(side).bisect_left(price) + 1
+
+    def level_visible(self, side: str, price: Decimal) -> bool:
+        """True while `price` is inside the subscribed depth: the side has fewer than `depth`
+        levels, or `price` is no worse than the worst level retained (§6.8)."""
+        levels = self.side(side)
+        if len(levels) < self.depth:
+            return True
+        worst = levels.peekitem(-1)[0]
+        return price >= worst if side == "bids" else price <= worst
+
+    def touch_qty(self, side: str) -> Decimal:
+        """Total quantity at the best level of `side` (0 if the side is empty)."""
+        levels = self.side(side)
+        return sum(levels.peekitem(0)[1].values(), Decimal(0)) if levels else Decimal(0)
+
+    def book_view(self, ts_ns: int, tick: Decimal, n_levels: int) -> BookView:
+        """Frozen strategy view of the current state (top `n_levels` per side)."""
+        bids, asks = (tuple(LevelSummary(*lvl) for lvl in self.levels(name, n_levels)) for name in BOOK_SIDES)
+        return BookView(self.symbol, ts_ns, tick, bids, asks, self.timestamp)
 
     def view(self) -> ReadOnlyBookView:
         return ReadOnlyBookView(self)
