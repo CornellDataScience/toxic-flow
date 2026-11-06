@@ -13,6 +13,8 @@ dependencies = [
     "certifi",
     "python-dotenv>=1.0",
     "sortedcontainers>=2.4",
+    "numpy>=1.26",
+    "pandas>=2.1",
 ]
 
 [project.optional-dependencies]

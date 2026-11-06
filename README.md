@@ -84,6 +84,103 @@ Symbols use Kraken v2 names (`BTC/USD`, not `XBT/USD`).
   `{"recv_ns": <local receive time>, "msg": <Kraken's exact JSON>}`. Every
   file begins with a fresh snapshot, so each hour can be replayed on its own.
 
+## Book query library (`toxicflow/bookquery`)
+
+Answers "what did the book look like at time t?" for the fill simulator,
+markouts and ML features.
+
+```python
+import glob
+from toxicflow.bookquery import BookQuery, build_tables
+
+# Until the event log / valid_intervals tables exist, build equivalents from raw files.
+tables = build_tables(glob.glob("data/raw/l3/*/*.jsonl.gz"),
+                      glob.glob("data/raw/public/*/*.jsonl.gz"), symbol="BTC/USD")
+bq = BookQuery.load(tables.events, tables.trades, tables.valid_intervals,
+                    pair=tables.pair, depth=tables.depth,
+                    clock="exchange", cache_dir="data/cache/bookquery")
+
+t = "2026-10-16T21:08:00Z"                  # or int ns, datetime, pd.Timestamp
+bq.best_at(t)                               # Best(bid_price, bid_qty, ask_price, ask_qty) as Decimal
+bq.mid_at(t), bq.spread_at(t)               # float; also take arrays of times (vectorized)
+bq.depth_at(t, levels=10)                   # {"bids": [(price, size), ...], "asks": [...]}
+bq.queue_at("bid", "81537.4", t)            # [(order_id, size), ...], front of queue first
+bq.queue_ahead("bid", "81537.4", t)         # size a new order joining now would wait behind
+bq.queue_ahead("bid", "81537.4", t, order_id="OTPONL-XSSW7-WQVKCF")
+bq.mid_after(fill_times, ("100ms", "1s", "10s"))   # DataFrame for markouts
+bq.is_valid(t)
+for step in bq.iter_book(t0, t1):           # sequential scan for the fill simulator
+    step.ts, step.book, step.events, step.reset
+```
+
+`scripts/markouts_example.py` computes markouts for a list of fills (recorded
+trades by default). `scripts/bench_bookquery.py` reproduces the timings below.
+
+### Rules
+
+- **As-of:** a query at `t` reflects every event with `ts <= t`, in original
+  message order (`seq`), and nothing after. All events at one timestamp
+  apply together. No lookahead, so features are safe for walk-forward evaluation.
+- **Clock:** times are int ns since the epoch (UTC). `clock="exchange"`
+  (default) uses Kraken's per-message `timestamp`. `clock="recv"` uses
+  local receive time. Horizons are in the same clock. Trade timestamps are
+  in the same exchange clock as L3 but truncated to microseconds, so a
+  fill's own L3 events land a few hundred ns *after* the trade's
+  timestamp. `mid_at(trade_ts)` is therefore the pre-trade mid.
+- **Validity:** outside a valid interval, queries return `None`/`NaN`, or
+  raise `InvalidTimeError` with `strict=True`. Every interval starts from a
+  fresh snapshot, so no book is carried across a gap. `mid_after(t, h)` is
+  `NaN` if `t + h` leaves the interval containing `t`. The adapter ends an
+  interval at a checksum mismatch (1 ns before the bad message), a silence
+  longer than `gap_s`, a recorder restart, a new snapshot, or the end of data.
+- **Queue priority** (each level is a FIFO queue, so position decides who
+  fills first): adds join the back of the queue. A size *decrease* (partial
+  fill or amend down) keeps the order's place. A size *increase* sends it to
+  the back, since exchanges won't let you jump the queue by enlarging an
+  order. Price changes arrive as delete + add. Only a delete removes an
+  order. These rules reproduce Kraken's checksum on every recorded message.
+- **Depth caveat:** the feed shows only the top `depth` levels per side
+  (100 in our recordings). Levels pushed past that are dropped, and anything
+  beyond the deepest visible level is *unknown, not empty*. `queue_at` and
+  `queue_ahead` there emit `OutsideDepthWarning`. Some `add` events are
+  "refills": old orders scrolling into view from below level 100, not new
+  orders. Their own `timestamp` field is older than the message.
+- **Precision:** prices and sizes are integer ticks/lots internally, and
+  book results are `Decimal`. `mid`/`spread`/array `best_at` are float64,
+  converted only through `units.ticks_to_float`.
+
+### Input tables (for swapping in the event log / valid_intervals outputs)
+
+| table | required columns | optional |
+|---|---|---|
+| events | `ts_<clock>` or `ts` (int ns), `seq` (message order), `order_id`, `side` (bid/ask), `event` (snapshot/add/modify/delete), `price_ticks`+`qty_lots` **or** `price`+`qty` (remaining size after the event) | `msg_id` (depth truncation per message), `symbol`, any extra columns (e.g. classification) pass through in `bq.events` |
+| trades | `ts_<clock>` or `ts`, price, qty, `side` (aggressor) | anything |
+| valid_intervals | `start_<clock>`/`end_<clock>` or `start`/`end` (inclusive ns) | `symbol` |
+
+Each interval's events must begin with the book's snapshot, because replay
+starts from an empty book at `start`. If the event log drops snapshot
+orders or `seq`, the library can't rebuild the book.
+
+### Benchmarks
+
+Measured on the 2.5-minute BTC/USD sample (14k events, 9.8k messages),
+Apple Silicon, Python 3.12, `checkpoint_every=500`:
+
+| operation | time |
+|---|---|
+| `build_tables` (raw replay + checksum per message) | 340 ms |
+| `BookQuery.load` (build / from disk cache) | 53 ms / 15 ms |
+| 10k random `mid_at`, one array call | 0.4 ms (0.04 µs each) |
+| 10k random `mid_at`, scalar loop | 180 ms (18 µs each) |
+| 10k `mid_after` × 3 horizons | 1.8 ms |
+| 1k random `book_at` | 500 ms (0.5 ms each) |
+| `iter_book` over all 8k timestamps | 51 ms |
+
+Pass arrays to the top-of-book functions: a single call is ~400× faster
+than looping. `book_at` costs ~4 µs × events replayed since the last
+checkpoint, so smaller `checkpoint_every` trades memory for speed. For
+walking forward in time, `iter_book` is far cheaper than repeated `book_at`.
+
 ## Troubleshooting
 
 - `CERTIFICATE_VERIFY_FAILED`: the code already uses `certifi`'s CA bundle. If
