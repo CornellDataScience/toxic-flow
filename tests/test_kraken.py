@@ -90,6 +90,20 @@ def test_l3_events_and_checksum():
     assert book.event_counts == {"modify": 1, "add": 1, "delete": 1}
 
 
+def test_l3_modify_qty_increase_loses_priority():
+    book = L3Book(BTC, depth=10)
+    snap = {"bids": [l3_order("B1", "100.0", "1"), l3_order("B2", "100.0", "2"), l3_order("B3", "100.0", "3")], "asks": []}
+    snap["checksum"] = crc32(l3_checksum_str([], [("100.0", "1"), ("100.0", "2"), ("100.0", "3")]))
+    assert book.apply("snapshot", snap)
+
+    # B1 grows -> back of the line; B2 shrinks -> keeps its place
+    update = {"bids": [l3_order("B1", "100.0", "5", "modify"), l3_order("B2", "100.0", "1.5", "modify")], "asks": []}
+    update["checksum"] = crc32(l3_checksum_str([], [("100.0", "1.5"), ("100.0", "3"), ("100.0", "5")]))
+    assert book.apply("update", update)
+    assert list(book.bids[Decimal("100.0")]) == ["B2", "B3", "B1"]
+    assert book.orders["B1"] == ("bids", Decimal("100.0"))
+
+
 def test_l3_depth_truncation_forgets_orders():
     book = L3Book(BTC, depth=1)
     snap = {"bids": [l3_order("B1", "100.0", "1")], "asks": [l3_order("A1", "101.0", "1")], "checksum": 0}

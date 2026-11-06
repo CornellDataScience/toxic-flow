@@ -62,7 +62,7 @@ def write_csv(path: Path, intervals) -> None:
 
 def print_summary(t: IntervalTracker, intervals, args) -> None:
     span = t.span_s
-    print(f"\n=== Summary ===")
+    print("\n=== Summary ===")
     print(f"recording:        {utc(t.first_ns)} -> {utc(t.last_ns)} UTC ({hms(span)}), "
           f"{len(args.files)} file(s), {t.sessions} writer session(s), {t.reconnects} reconnect(s)")
     print(f"longest msg gap:  {t.longest_gap_s:.2f}s (starting {utc(t.longest_gap_at_ns)} UTC)" if t.longest_gap_at_ns else
@@ -89,6 +89,8 @@ def print_summary(t: IntervalTracker, intervals, args) -> None:
         print(f"  desync periods         {st.desync_periods}"
               + (f"  (total {sum(st.desync_s):.1f}s, longest {max(st.desync_s):.1f}s, median {sorted(st.desync_s)[len(st.desync_s) // 2]:.2f}s)"
                  if st.desync_s else ""))
+        print(f"  resync breaks          {ends['resnapshot']}  (fresh snapshot mid-interval: the recorder resynced, "
+              f"so there's a short hole even though our book still matched)")
         print(f"  snapshots / updates    {st.snapshots:,} / {st.updates:,}  (skipped while unsynced: {st.skipped_unsynced:,})")
         print(f"  valid intervals        {len(ivs)}  (longest {hms(max((iv.duration_s for iv in ivs), default=0))}, "
               f"median {hms(sorted(iv.duration_s for iv in ivs)[len(ivs) // 2] if ivs else 0)})")
@@ -102,6 +104,7 @@ def print_summary(t: IntervalTracker, intervals, args) -> None:
     print(f"\nOVERALL ({n} symbol(s))")
     print(f"  checksum pass rate     {100 * total_ok / checked if checked else 0:.4f}%")
     print(f"  desync periods         {sum(st.desync_periods for st in t.stats.values())}")
+    print(f"  resync breaks          {sum(1 for iv in intervals if iv.end_reason == 'resnapshot')}")
     print(f"  longest message gap    {t.longest_gap_s:.2f}s")
     print(f"  valid data             {100 * total_valid / (span * n) if span and n else 0:.2f}% of symbol-time")
 

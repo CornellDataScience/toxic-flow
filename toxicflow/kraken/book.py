@@ -150,10 +150,16 @@ class L3Book(_BaseBook):
         self.orders[oid] = (name, price)
 
     def _modify(self, name: str, oid: str, price: Decimal, qty: Decimal) -> None:
-        if self.orders.get(oid) == (name, price):
-            self.side(name)[price][oid] = qty  # qty change keeps the order's position
+        # Queue priority on a modify:
+        #   - qty decreases (or stays the same) at the same price: the order keeps its position.
+        #   - qty increases: the order loses priority and goes to the back of the level.
+        #   - price changes, or the order is unknown: it goes to the back of the new level.
+        # Keeping position on increases broke the L3 checksum, which hashes orders in queue order.
+        level = self.side(name).get(price) if self.orders.get(oid) == (name, price) else None
+        if level is not None and qty <= level[oid]:
+            level[oid] = qty
         else:
-            self._add(name, oid, price, qty)  # unknown order or price moved: append to level
+            self._add(name, oid, price, qty)  # _add removes the old entry, then appends
 
     def _delete(self, oid: str) -> None:
         loc = self.orders.pop(oid, None)

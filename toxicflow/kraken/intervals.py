@@ -17,7 +17,10 @@ An interval ends (reason in parentheses) when:
     new connection_id, and the recorder resets its books and resubscribes.
   - a new file / writer session starts (file_boundary): every meta line means
     the recorder resubscribed, so a fresh snapshot follows.
-  - a new snapshot arrives while the book was valid (resnapshot).
+  - a new snapshot arrives while the book was valid (resnapshot). The recorder
+    unsubscribed and resubscribed (e.g. its own live book failed a checksum),
+    so events between the unsubscribe and the snapshot are missing. Recordings
+    made before the L3 modify fix contain many of these.
   - the data ends (end_of_data).
 
 All times are local receive times (recv_ns).
