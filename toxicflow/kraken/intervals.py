@@ -26,7 +26,7 @@ An interval ends (reason in parentheses) when:
 All times are local receive times (recv_ns).
 """
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from .book import L3Book, PairInfo
@@ -73,10 +73,18 @@ class _Open:
 
 
 class IntervalTracker:
-    """Feed it (recv_ns, kind, payload) records in time order, then call finish()."""
+    """Feed it (recv_ns, kind, payload) records in time order, then call finish().
 
-    def __init__(self, gap_s: float = 5.0):
+    book_factory builds the per-symbol book (an L3Book subclass can observe events).
+    on_item(recv_ns, msg_type, item, book, valid) runs after each book item; valid
+    is True when the item's checksum passed, so the item lies inside a valid interval.
+    """
+
+    def __init__(self, gap_s: float = 5.0, book_factory: Callable[..., L3Book] = L3Book,
+                 on_item: Callable[[int, str, dict, L3Book, bool], None] | None = None):
         self.gap_ns = int(gap_s * 1e9)
+        self.book_factory = book_factory
+        self.on_item = on_item
         self.intervals: list[Interval] = []
         self.stats: dict[str, SymbolStats] = {}
         self.gaps: list[tuple[int, float]] = []  # (start recv_ns, seconds) for gaps > gap_s
@@ -155,6 +163,9 @@ class IntervalTracker:
             raise ValueError("level3 message before any meta line; can't get pair precision")
         for item in msg["data"]:
             self._on_book_item(recv_ns, msg["type"], item)
+            if self.on_item is not None:
+                sym = item["symbol"]
+                self.on_item(recv_ns, msg["type"], item, self._books[sym], sym in self._open)
 
     def _on_book_item(self, recv_ns: int, msg_type: str, item: dict) -> None:
         sym = item["symbol"]
@@ -162,7 +173,7 @@ class IntervalTracker:
         book = self._books.get(sym)
         if book is None:
             p = self._meta["pairs"][sym]
-            book = self._books[sym] = L3Book(PairInfo(sym, p["price_precision"], p["qty_precision"]), self._meta["depth"])
+            book = self._books[sym] = self.book_factory(PairInfo(sym, p["price_precision"], p["qty_precision"]), self._meta["depth"])
 
         if msg_type == "snapshot":
             st.snapshots += 1
