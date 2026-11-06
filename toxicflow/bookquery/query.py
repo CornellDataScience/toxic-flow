@@ -104,7 +104,7 @@ class BookQuery:
         symbol: str | None = None,
         depth: int | None = None,
         clock: str = "exchange",
-        checkpoint_every: int = 2000,
+        checkpoint_every: int = 500,
         cache_dir: Path | str | None = None,
         strict: bool = False,
     ) -> "BookQuery":
