@@ -9,6 +9,7 @@ from toxicflow.execsim.config import SimConfig
 from toxicflow.execsim.execution import FillRecorder
 from toxicflow.execsim.markouts import sample_mids
 from toxicflow.execsim.metrics import analyze, format_report, required_mid_times
+from toxicflow.execsim.models import Evidence
 from toxicflow.execsim.models import Side
 from toxicflow.execsim.orders import OrderState
 from toxicflow.execsim.reader import KIND_META, RecordingReader, book_items, file_hour, list_files
@@ -17,6 +18,7 @@ from toxicflow.execsim.results import DISCONTINUITY_KINDS
 from toxicflow.execsim.schedule import PlacementSchedule
 from toxicflow.execsim.strategies import ImproveQuoteStrategy, JoinBestStrategy, QuoteDeeperStrategy
 from toxicflow.execsim.timeutil import S
+from toxicflow.execsim.trades import TradeIndex, attribute_trades
 from toxicflow.kraken.book import L3Book, PairInfo
 from toxicflow.kraken.config import DATA_DIR
 
@@ -175,3 +177,52 @@ def test_metrics_on_real_hour():
     # placement frequency differs: improve_quote is conditional on a 2-tick spread
     assert report.lifecycle["improve_quote"].placed < report.lifecycle["join_best"].placed
     print("\n" + format_report(report, markout_horizons_ns=(S, 5 * S, 10 * S)))
+
+
+PUBLIC_FILE = next((p for p in list_files(DATA_DIR / "raw", "public") if p.name == "public_2026-10-18T14.jsonl.gz"),
+                   None)
+
+
+@pytest.mark.skipif(EVAL_FILE is None or PUBLIC_FILE is None, reason="hour 14 L3 + public recordings not present")
+def test_trade_attribution_on_real_hour():
+    symbols = ("BTC/USD", "ETH/USD")
+    start = int(file_hour(EVAL_FILE, "l3").timestamp()) * S
+    schedule = PlacementSchedule.regular(symbols, start, start + 3600 * S, 10 * S)
+    cfg = SimConfig(symbols=symbols, order_qty={s: "0.001" for s in symbols}, horizon_ns=10 * S)
+    names = ["join_best", "improve_quote", "quote_deeper"]
+    index = TradeIndex.from_files([PUBLIC_FILE], symbols, gap_ns=cfg.gap_ns)
+    att = attribute_trades(cfg, index, files=[EVAL_FILE])
+    result = HistoricalReplayEngine(cfg, [JoinBestStrategy(), ImproveQuoteStrategy(), QuoteDeeperStrategy()],
+                                    schedule, on_reach=FillRecorder(att)).run([EVAL_FILE])
+    mids = sample_mids(cfg, required_mid_times(result, cfg, evidence=("l3_only", "trades")), files=[EVAL_FILE])
+    l3 = analyze(result, cfg, mids, strategies=names)
+    tr = analyze(result, cfg, mids, strategies=names, evidence="trades", attribution=att)
+
+    # every print is accounted for exactly once, and no print's volume is used twice
+    n_trades = sum(len(v) for v in index.trades.values())
+    assert sum(att.stats["trades"].values()) == n_trades
+    by_ref = {(sym, t.ref): t.qty for sym, ts in index.trades.items() for t in ts}
+    assert all(0 <= used <= by_ref[k] for k, used in att.trade_used.items())
+    attributed = sum((p.qty for r in att.by_ref.values() for p in r.parts
+                      if p.evidence in (Evidence.TRADE_CONFIRMED, Evidence.TRADE_PLAUSIBLE)), D(0))
+    assert attributed == sum(att.trade_used.values())
+    matched = sum(n for k, n in att.stats["trades"].items() if k.endswith("|MATCHED"))
+    assert matched >= 0.99 * n_trades, att.stats["trades"]  # measured: 1524 of 1527 on this hour
+
+    # placement and queue do not depend on evidence; trade-mode fills are bounded by the L3-only upper bound
+    assert l3.lifecycle == tr.lifecycle and l3.queue == tr.queue and l3.request_counts == tr.request_counts
+    order_by_id = {o.order_id: o for o in tr.orders if o.outcomes}
+    for o in l3.orders:
+        if not o.outcomes:
+            continue
+        t = order_by_id[o.order_id].outcomes
+        got = [t[p].filled_qty for p in ("conservative", "balanced", "optimistic")]
+        assert got == sorted(got) and got[2] <= o.outcomes["optimistic"].filled_qty and got[2] <= o.qty
+    allowed = {"conservative": {"TRADE_CONFIRMED"}, "balanced": {"TRADE_CONFIRMED", "TRADE_PLAUSIBLE"}}
+    keys = [(f.policy, f.order_id, f.event_ref) for f in tr.fills]
+    assert len(keys) == len(set(keys))
+    for f in tr.fills:
+        assert "TRADE_ABSENT" not in f.qty_by_evidence and sum(f.qty_by_evidence.values()) == f.qty
+        assert set(f.qty_by_evidence) <= allowed.get(f.policy, set(f.qty_by_evidence))
+    print("\n" + format_report(l3, markout_horizons_ns=(S, 10 * S)) + "\n\n" +
+          format_report(tr, markout_horizons_ns=(S, 10 * S)))

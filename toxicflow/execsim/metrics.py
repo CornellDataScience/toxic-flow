@@ -29,12 +29,21 @@ before inserted + H. Per policy, a placed order is then exactly one of
     censored_unfilled  filled == 0 and censored: outcome unknown, never counted as a non-fill
 
 Rates are Rate(num, den); value is None when den == 0 (never a silent 0).
+
+Evidence modes (analyze(evidence=...)); one replay supports both when it ran with
+FillRecorder(attribution):
+    l3_only   policies apply the L3-only thresholds to each candidate's L3 label (the Stage 4
+              meaning; the default)
+    trades    policies apply the with-trades thresholds to each candidate's trade slices
+              (trades.py): conservative = TRADE_CONFIRMED, balanced >= TRADE_PLAUSIBLE,
+              optimistic >= L3_CROSS_ARRIVAL; TRADE_ABSENT (an unmatched reduction while the
+              trade feed is healthy) never counts
 """
 
 import bisect
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 from fractions import Fraction
 from pathlib import Path
@@ -43,14 +52,16 @@ from .config import SimConfig
 from .execution import POLICY_NAMES, FillRecorder, PolicyOutcome, settle
 from .markouts import (DEFAULT_MARKOUT_HORIZONS_NS, MidSample, drift_bps, edge_bps, sample_mids, signed_markout_bps,
                        view_mid)
-from .models import EndReason, Evidence, Mechanism, PlacementRequest, Side, SkipReason
+from .models import EndReason, Evidence, EvidencePart, Mechanism, PlacementRequest, Side, SkipReason
 from .orders import OrderState
 from .replay import HistoricalReplayEngine
 from .results import DISCONTINUITY_KINDS, ReplayResult, SkipRecord
 from .strategies import OrderPlacementStrategy
 from .timeutil import MS
+from .trades import DEFAULT_TOLERANCE, MatchTolerance, TradeIndex, attribute_trades
 
 ELIGIBLE, DATA_GATE, COVERAGE = "ELIGIBLE", "DATA_GATE", "COVERAGE"
+EVIDENCE_MODES = ("l3_only", "trades")
 SKIPPED, INSERT_SKIPPED, PLACED = "SKIPPED", "INSERT_SKIPPED", "PLACED"
 AHEAD_ORDER_BUCKETS = ((0, 0, "0"), (1, 2, "1-2"), (3, 5, "3-5"), (6, 10, "6-10"), (11, None, "11+"))
 LEVEL_RANK_BUCKETS = ((1, 1, "1"), (2, 2, "2"), (3, None, "3+"))
@@ -186,6 +197,7 @@ class FillObs:
     ahead_qty: Decimal | None  # tracker's queue ahead when the reduction reached us (0 for LEVEL)
     markout_bps: dict[int, Decimal | None]  # horizon_ns -> signed markout; None when the future mid is missing
     markout_missing: dict[int, str | None]  # horizon_ns -> why it is missing
+    qty_by_evidence: dict[str, Decimal] = None  # settled qty split by the evidence that justified it
 
 
 # --- summaries -------------------------------------------------------------------------------------------------
@@ -265,6 +277,20 @@ class FillSummary:
     fill_by_level_rank: dict[str, Rate]
     ahead_qty_at_fill: Dist  # observed at the reach event only
     markouts: dict[int, MarkoutSummary]
+    fill_qty_by_evidence: dict[str, Decimal] = None  # settled volume by evidence class
+    fills_by_evidence: dict[str, int] = None  # settled fills by their strongest evidence class
+
+
+@dataclass(frozen=True, slots=True)
+class EvidenceStats:
+    """Every candidate (policy independent) of one strategy's eligible placed orders before
+    inserted + H, by evidence class: L3 labels in l3_only mode, trade slices in trades mode.
+    In trades mode L3_DELETE_AMBIGUOUS / L3_MODIFY_DOWN slices are the ambiguous ones (no
+    healthy trade feed there) and TRADE_ABSENT slices are reductions with no execution evidence."""
+
+    n_candidates: int
+    candidates_by_evidence: dict[str, int]  # candidates holding any slice of that class
+    qty_by_evidence: dict[str, Decimal]  # unclipped historical volume
 
 
 @dataclass
@@ -281,6 +307,9 @@ class EvaluationReport:
     lifecycle: dict[str, Lifecycle]
     queue: dict[str, QueueStats]
     summary: dict[tuple[str, str], FillSummary]  # (strategy, policy)
+    evidence_mode: str = "l3_only"
+    evidence: dict[str, EvidenceStats] = field(default_factory=dict)
+    attribution: dict | None = None  # TradeAttribution.stats (recording-wide), when supplied
 
 
 # --- analysis ----------------------------------------------------------------------------------------------------
@@ -289,43 +318,78 @@ class EvaluationReport:
 def evaluate(cfg: SimConfig, strategies: Sequence[OrderPlacementStrategy], schedule: Iterable[PlacementRequest],
              files: Sequence[Path], horizon_ns: int | None = None,
              markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
-             policies: Sequence[str] = POLICY_NAMES) -> tuple[ReplayResult, EvaluationReport]:
-    """Replay with fill recording, sample the mids the markouts need (second pass), and analyze."""
-    eng = HistoricalReplayEngine(cfg, strategies, schedule, on_reach=FillRecorder())
+             policies: Sequence[str] = POLICY_NAMES, trade_files: Sequence[Path] | None = None,
+             evidence: str = "l3_only",
+             tolerance: MatchTolerance = DEFAULT_TOLERANCE) -> tuple[ReplayResult, EvaluationReport]:
+    """Replay with fill recording, sample the mids the markouts need (second pass), and analyze.
+
+    evidence='trades' needs `trade_files` (public-stream recordings covering the same hours).
+    """
+    if evidence == "trades" and not trade_files:
+        raise ValueError("evidence='trades' needs trade_files")
+    result, reports = evaluate_modes(cfg, strategies, schedule, files, horizon_ns, markout_horizons_ns, policies,
+                                     trade_files, tolerance, modes=(evidence,))
+    return result, reports[evidence]
+
+
+def evaluate_modes(cfg: SimConfig, strategies: Sequence[OrderPlacementStrategy],
+                   schedule: Iterable[PlacementRequest], files: Sequence[Path], horizon_ns: int | None = None,
+                   markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
+                   policies: Sequence[str] = POLICY_NAMES, trade_files: Sequence[Path] | None = None,
+                   tolerance: MatchTolerance = DEFAULT_TOLERANCE,
+                   modes: Sequence[str] | None = None) -> tuple[ReplayResult, dict[str, EvaluationReport]]:
+    """One replay, one mid-sampling pass, one report per evidence mode (default: 'l3_only', plus
+    'trades' when `trade_files` are given), so the two modes are compared on identical orders."""
+    attribution = None
+    if trade_files:
+        index = TradeIndex.from_files(trade_files, cfg.symbols, gap_ns=cfg.gap_ns, tolerance=tolerance)
+        attribution = attribute_trades(cfg, index, files=files)
+    eng = HistoricalReplayEngine(cfg, strategies, schedule, on_reach=FillRecorder(attribution))
     result = eng.run(files)
-    times = required_mid_times(result, cfg, horizon_ns, markout_horizons_ns, policies)
+    if modes is None:
+        modes = EVIDENCE_MODES if attribution is not None else ("l3_only",)
+    times = required_mid_times(result, cfg, horizon_ns, markout_horizons_ns, policies, evidence=modes)
     mids = sample_mids(cfg, times, files=files)
-    report = analyze(result, cfg, mids, horizon_ns, markout_horizons_ns, policies,
-                     strategies=[s.name for s in strategies])
-    return result, report
+    reports = {m: analyze(result, cfg, mids, horizon_ns, markout_horizons_ns, policies,
+                          strategies=[s.name for s in strategies], evidence=m, attribution=attribution)
+               for m in modes}
+    return result, reports
 
 
 def required_mid_times(result: ReplayResult, cfg: SimConfig, horizon_ns: int | None = None,
                        markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
-                       policies: Sequence[str] = POLICY_NAMES) -> set[tuple[str, int]]:
-    """(symbol, ts) pairs analyze() needs mids for: every settled fill + D, and every eligible request T + D."""
-    report = analyze(result, cfg, None, horizon_ns, markout_horizons_ns, policies)
-    times = {(f.symbol, f.ts_ns + d) for f in report.fills for d in report.markout_horizons_ns}
-    times |= {(r.request.symbol, r.request.ts_ns + d) for r in report.requests if r.status == ELIGIBLE
-              for d in report.markout_horizons_ns}
+                       policies: Sequence[str] = POLICY_NAMES,
+                       evidence: str | Sequence[str] = "l3_only") -> set[tuple[str, int]]:
+    """(symbol, ts) pairs analyze() needs mids for: every settled fill + D (in each evidence mode),
+    and every eligible request T + D."""
+    times: set[tuple[str, int]] = set()
+    for mode in (evidence,) if isinstance(evidence, str) else evidence:
+        report = analyze(result, cfg, None, horizon_ns, markout_horizons_ns, policies, evidence=mode)
+        times |= {(f.symbol, f.ts_ns + d) for f in report.fills for d in report.markout_horizons_ns}
+        times |= {(r.request.symbol, r.request.ts_ns + d) for r in report.requests if r.status == ELIGIBLE
+                  for d in report.markout_horizons_ns}
     return times
 
 
 def analyze(result: ReplayResult, cfg: SimConfig, mids: dict[tuple[str, int], MidSample] | None = None,
             horizon_ns: int | None = None, markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
-            policies: Sequence[str] = POLICY_NAMES, strategies: Sequence[str] | None = None) -> EvaluationReport:
+            policies: Sequence[str] = POLICY_NAMES, strategies: Sequence[str] | None = None,
+            evidence: str = "l3_only", attribution=None) -> EvaluationReport:
     """Metrics for every strategy in `result` at analysis horizon H = `horizon_ns` (default: the run's).
 
-    `result` must come from a replay with FillRecorder as `on_reach`; without `mids`, every markout
-    is missing ('NOT_SAMPLED').
+    `result` must come from a replay with FillRecorder as `on_reach` (with a TradeAttribution for
+    evidence='trades'); without `mids`, every markout is missing ('NOT_SAMPLED'). `attribution`
+    only adds its recording-wide accounting to the report.
     """
+    if evidence not in EVIDENCE_MODES:
+        raise ValueError(f"evidence must be one of {EVIDENCE_MODES}, got {evidence!r}")
     H = cfg.horizon_ns if horizon_ns is None else horizon_ns
     if not 0 < H <= cfg.horizon_ns:
         raise ValueError(f"analysis horizon must be in (0, {cfg.horizon_ns}], got {horizon_ns}")
     horizons = tuple(markout_horizons_ns)
     if any(d <= 0 for d in horizons) or len(set(horizons)) != len(horizons):
         raise ValueError(f"markout horizons must be positive and unique, got {horizons}")
-    _check_fill_recording(result)
+    _check_fill_recording(result, with_trades=evidence == "trades")
 
     records: dict[tuple[str, str], object] = {}
     reqs: dict[str, PlacementRequest] = {}
@@ -360,19 +424,20 @@ def analyze(result: ReplayResult, cfg: SimConfig, mids: dict[tuple[str, int], Mi
     fills: list[FillObs] = []
     for r in requests:
         for name in names:
-            obs = _order_obs(records[(r.request.request_id, name)], r, H, policies)
+            obs = _order_obs(records[(r.request.request_id, name)], r, H, policies, evidence == "trades")
             orders.append(obs)
             if obs.eligible and obs.stage == PLACED:
                 fills.extend(_fill_obs(obs, policies, reach_ahead, mids, horizons))
 
     baseline = _drift_baseline(requests, mids, horizons)
     report = EvaluationReport(H, cfg.latency_ns, names, tuple(policies), horizons, requests, orders, fills, {}, {},
-                              {}, {})
+                              {}, {}, evidence, {}, attribution.stats if attribution is not None else None)
     _summarize(report, baseline)
+    report.evidence = _evidence_stats(report, records)
     return report
 
 
-def _check_fill_recording(result: ReplayResult) -> None:
+def _check_fill_recording(result: ReplayResult, with_trades: bool = False) -> None:
     reaches = Counter(r.order_id for r in result.reaches)
     for o in result.orders:
         if o.state is not OrderState.ENDED:
@@ -383,6 +448,13 @@ def _check_fill_recording(result: ReplayResult) -> None:
         refs = [f.event_ref for f in o.fills]
         if len(set(refs)) != len(refs):
             raise ValueError(f"order {o.order_id} has two candidates from the same event")
+        for f in o.fills:
+            if f.attribution is None:
+                if with_trades:
+                    raise ValueError(f"order {o.order_id} has candidates without trade attribution: "
+                                     "replay with FillRecorder(attribution) for evidence='trades'")
+            elif sum((p.qty for p in f.attribution), Decimal(0)) != f.qty:
+                raise ValueError(f"order {o.order_id}: trade slices of {f.event_ref} do not sum to its volume")
 
 
 def _coverage_breaks(result: ReplayResult) -> dict[str, tuple[list[int], list[str], int | None]]:
@@ -414,7 +486,7 @@ def _coverage_break(breaks, start: int, stop: int) -> str | None:
     return None
 
 
-def _order_obs(rec, r: RequestObs, H: int, policies: Sequence[str]) -> OrderObs:
+def _order_obs(rec, r: RequestObs, H: int, policies: Sequence[str], with_trades: bool) -> OrderObs:
     eligible = r.status == ELIGIBLE
     if isinstance(rec, SkipRecord):  # SkipRecord: strategy skip (or the data gate for every strategy)
         return OrderObs(r.request, rec.strategy, eligible, SKIPPED, rec.reason)
@@ -423,7 +495,7 @@ def _order_obs(rec, r: RequestObs, H: int, policies: Sequence[str]) -> OrderObs:
         return OrderObs(r.request, o.strategy, eligible, INSERT_SKIPPED, o.skip_reason, o.order_id, o.price, o.qty)
     censored = o.end_reason.censored and o.end_ts < o.inserted_ts + H
     edge = edge_bps(o.side, o.price, r.decision_mid) if r.decision_mid is not None else None
-    outcomes = {p: settle(o, p, until_ns=o.inserted_ts + H) for p in policies}
+    outcomes = {p: settle(o, p, until_ns=o.inserted_ts + H, with_trades=with_trades) for p in policies}
     return OrderObs(r.request, o.strategy, eligible, PLACED, None, o.order_id, o.price, o.qty, o.inserted_ts,
                     o.end_ts, o.end_reason, censored, o.queue_ahead_qty0, o.queue_ahead_orders0, o.level_rank0,
                     o.touch_qty0, edge, outcomes)
@@ -445,7 +517,8 @@ def _fill_obs(o: OrderObs, policies, reach_ahead, mids, horizons) -> list[FillOb
                     marks[d], why[d] = signed_markout_bps(o.request.side, c.price, sample.mid), None
             out.append(FillObs(p, o.strategy, o.order_id, o.request.symbol, o.request.side, c.ts_ns,
                                c.ts_ns - o.inserted_ts, c.price, sf.qty, c.qty, c.mechanism, c.evidence, c.event_ref,
-                               reach_ahead.get((o.order_id, c.event_ref)), marks, why))
+                               reach_ahead.get((o.order_id, c.event_ref)), marks, why,
+                               _sum_by_evidence(sf.by_evidence)))
     return out
 
 
@@ -580,6 +653,8 @@ def _fill_summary(report, name, p, obs, placed, common, fills, baseline) -> Fill
         fill_by_level_rank=bucket_rates(lambda o: o.level_rank0, LEVEL_RANK_BUCKETS),
         ahead_qty_at_fill=Dist.of(f.ahead_qty for f in fills if f.ahead_qty is not None),
         markouts={d: _markout_summary(d, fills, baseline) for d in report.markout_horizons_ns},
+        fill_qty_by_evidence=_merge_qty(f.qty_by_evidence for f in fills),
+        fills_by_evidence=_counts(max(f.qty_by_evidence, key=lambda k: Evidence[k]) for f in fills),
     )
 
 
@@ -606,6 +681,43 @@ def _counts(items) -> dict[str, int]:
     return dict(sorted(Counter(items).items()))
 
 
+def _sum_by_evidence(parts) -> dict[str, Decimal]:
+    out: dict[str, Decimal] = defaultdict(Decimal)
+    for p in parts:
+        out[p.evidence.name] += p.qty
+    return dict(sorted(out.items()))
+
+
+def _merge_qty(dicts) -> dict[str, Decimal]:
+    out: dict[str, Decimal] = defaultdict(Decimal)
+    for d in dicts:
+        for k, v in d.items():
+            out[k] += v
+    return dict(sorted(out.items()))
+
+
+def _evidence_stats(report: EvaluationReport, records) -> dict[str, EvidenceStats]:
+    trades = report.evidence_mode == "trades"
+    out = {}
+    for name in report.strategies:
+        n, count, qty = 0, Counter(), defaultdict(Decimal)
+        for o in report.orders:
+            if o.strategy != name or not o.eligible or o.stage != PLACED:
+                continue
+            order = records[(o.request.request_id, name)]
+            for c in order.fills:
+                if c.ts_ns >= o.inserted_ts + report.horizon_ns:
+                    continue
+                n += 1
+                parts = c.attribution if trades else (EvidencePart(c.qty, c.evidence),)
+                for cls in {p.evidence.name for p in parts}:
+                    count[cls] += 1
+                for p in parts:
+                    qty[p.evidence.name] += p.qty
+        out[name] = EvidenceStats(n, dict(sorted(count.items())), dict(sorted(qty.items())))
+    return out
+
+
 # --- comparison ----------------------------------------------------------------------------------------------
 
 
@@ -615,7 +727,8 @@ def comparison_rows(report: EvaluationReport, policy: str) -> list[dict]:
     for name in report.strategies:
         lc, q, s = report.lifecycle[name], report.queue[name], report.summary[(name, policy)]
         row = {
-            "strategy": name, "policy": policy, "horizon_ns": report.horizon_ns,
+            "strategy": name, "policy": policy, "evidence_mode": report.evidence_mode,
+            "horizon_ns": report.horizon_ns,
             "eligible": lc.eligible, "strategy_skips": lc.strategy_skips, "insertion_skips": lc.insertion_skips,
             "placed": lc.placed, "censored": lc.censored, "placement_rate": lc.placement_rate,
             "filled_any": s.filled_any, "filled_full": s.filled_full,
@@ -624,6 +737,7 @@ def comparison_rows(report: EvaluationReport, policy: str) -> list[dict]:
             "km_median_ttf_ns": s.km_first_fill.median_ns, "km_fill_prob": s.km_first_fill.fill_prob_at_horizon,
             "median_ttf_ns": s.time_to_first_fill_ns.median, "median_ahead_qty0": q.ahead_qty.median,
             "median_ahead_orders0": q.ahead_orders.median, "mean_edge_bps": q.edge_bps.mean, "n_fills": s.n_fills,
+            "fill_qty_by_evidence": s.fill_qty_by_evidence,
         }
         for d, m in s.markouts.items():
             row[f"markout_{_label(d)}_n"] = m.n_valid
@@ -638,7 +752,8 @@ def format_report(report: EvaluationReport, markout_horizons_ns: Sequence[int] |
     """Plain-text summary: request accounting, lifecycle, then one fill/markout table per policy."""
     rc = report.request_counts
     shown = tuple(markout_horizons_ns or report.markout_horizons_ns)
-    lines = [f"horizon {report.horizon_ns / 1e9:g}s, latency {report.latency_ns / 1e6:g}ms",
+    lines = [f"evidence {report.evidence_mode}, horizon {report.horizon_ns / 1e9:g}s, "
+             f"latency {report.latency_ns / 1e6:g}ms",
              f"requests {rc['total']}: eligible {rc['eligible']}, common support {rc['common_support']}, "
              f"data gate {rc['data_gate']}, coverage {rc['coverage']}", "",
              f"{'strategy':<16}{'eligible':>9}{'skips':>7}{'ins.skip':>9}{'placed':>8}{'place rate':>11}"
@@ -649,6 +764,16 @@ def format_report(report: EvaluationReport, markout_horizons_ns: Sequence[int] |
         lines.append(f"{name:<16}{lc.eligible:>9}{lc.strategy_skips:>7}{lc.insertion_skips:>9}{lc.placed:>8}"
                      f"{_f(pr):>11}{lc.expired:>9}{lc.censored:>9}  "
                      f"{ {**lc.strategy_skip_reasons, **lc.insertion_skip_reasons} or ''}")
+    lines += ["", "candidate volume by evidence (eligible placed orders, before H; n candidates)"]
+    for name in report.strategies:
+        ev = report.evidence.get(name)
+        if ev is not None:
+            lines.append(f"{name:<16}{ev.n_candidates:>7}  " + ", ".join(
+                f"{k} {ev.candidates_by_evidence[k]} / {_f(v)}" for k, v in ev.qty_by_evidence.items()))
+    if report.attribution:
+        a = report.attribution
+        lines += ["", f"trade attribution (whole recording): trades {a['trades']}",
+                  f"  plausible executions by label: {a['reductions']}", f"  trade feed: {a['trade_feed']}"]
     for p in report.policies:
         lines += ["", f"policy {p}",
                   f"{'strategy':<16}{'filled':>7}{'P(f|placed)':>18}{'P(f|opp)':>18}{'P(f|common)':>18}"
@@ -662,8 +787,10 @@ def format_report(report: EvaluationReport, markout_horizons_ns: Sequence[int] |
                 m = s.markouts[d]
                 row += f"{f'{m.n_valid} / {_f(m.mean)} / {_f(m.median)} / {_f(m.frac_negative.value)}':>32}"
             lines.append(row)
+    caveat = ("L3-only policies bracket the truth (conservative is always 0)." if report.evidence_mode == "l3_only"
+              else "Trade mode: conservative = same-µs trade matches only; policies remain bounds.")
     lines += ["", "Markouts in bps vs the fill price, positive = favorable. Descriptive only: no significance "
-              "or profitability claim; L3-only policies bracket the truth (conservative is always 0)."]
+              f"or profitability claim. {caveat}"]
     return "\n".join(lines)
 
 

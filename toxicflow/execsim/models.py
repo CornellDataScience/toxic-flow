@@ -138,11 +138,23 @@ class ReachEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class EvidencePart:
+    """A slice of one candidate's volume with a single trade-attribution label (§6.5.4: a partially
+    covered reduction counts only for the covered part)."""
+
+    qty: Decimal
+    evidence: Evidence
+    trade_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
 class FillCandidate:
     ts_ns: int | None
     price: Decimal  # our limit price: a maker fills at its own price
     qty: Decimal  # unclipped historical volume
     mechanism: Mechanism
-    evidence: Evidence
+    evidence: Evidence  # L3-only label (rank 1 to 3), always set
     event_ref: tuple[int | None, int]
     trade_ids: tuple[int, ...] = ()
+    # trade-attributed slices summing to qty; None when the replay had no trade data
+    attribution: tuple[EvidencePart, ...] | None = None

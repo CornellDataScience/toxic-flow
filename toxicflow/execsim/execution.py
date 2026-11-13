@@ -18,15 +18,18 @@ the same label for each:
     LEVEL / INTERCEPT, delete   -> L3_DELETE_AMBIGUOUS (rank 2)
     LEVEL / INTERCEPT, modify   -> L3_MODIFY_DOWN      (rank 3)
 
-Trade-based ranks (TRADE_ABSENT, TRADE_PLAUSIBLE, TRADE_CONFIRMED) need the
-Phase 3 TradeIndex and are never produced here.
+Trade-based ranks (TRADE_ABSENT, TRADE_PLAUSIBLE, TRADE_CONFIRMED) come from trades.py:
+give FillRecorder a TradeAttribution and each candidate also carries `attribution`, its
+volume split into trade-labeled slices. `evidence` always keeps the L3 label, so one replay
+can be settled both ways: settle(..., with_trades=False) is the L3-only bracket,
+with_trades=True applies the trade thresholds to the slices.
 """
 
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
 
-from .models import Evidence, FillCandidate, Mechanism, ReachEvent
+from .models import Evidence, EvidencePart, FillCandidate, Mechanism, ReachEvent
 from .orders import SimulatedOrder
 from .sim_book import BookEvent
 
@@ -60,9 +63,18 @@ def l3_evidence(mechanism: Mechanism, event_kind: str) -> Evidence:
 
 
 class FillRecorder:
-    """Engine `on_reach` hook: records each ReachEvent as a FillCandidate on its order."""
+    """Engine `on_reach` hook: records each ReachEvent as a FillCandidate on its order.
+
+    `attribution` (a trades.TradeAttribution built from the same L3 files) adds the trade slices.
+    """
+
+    def __init__(self, attribution=None):
+        self.attribution = attribution
 
     def __call__(self, order: SimulatedOrder, reach: ReachEvent, ev: BookEvent) -> None:
+        parts = None
+        if self.attribution is not None:
+            parts = self.attribution.parts_for(reach.ref, ev, reach.volume, reach.mechanism)
         order.add_fill(FillCandidate(
             ts_ns=reach.item_ts_ns,
             price=order.price,  # a maker fills at its own limit price
@@ -70,6 +82,8 @@ class FillRecorder:
             mechanism=reach.mechanism,
             evidence=l3_evidence(reach.mechanism, ev.kind),
             event_ref=reach.ref,
+            trade_ids=tuple(i for p in parts or () for i in p.trade_ids),
+            attribution=parts,
         ))
 
 
@@ -81,10 +95,14 @@ class FillStatus(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class SettledFill:
-    """The part of one candidate that a policy counts: `qty` is clipped to what the order still needed."""
+    """The part of one candidate that a policy counts: `qty` is clipped to what the order still needed.
+
+    `by_evidence` splits `qty` over the evidence that justified it, strongest evidence used first.
+    """
 
     candidate: FillCandidate
     qty: Decimal
+    by_evidence: tuple[EvidencePart, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,6 +122,10 @@ def settle(order: SimulatedOrder, policy: str | Policy, until_ns: int | None = N
     `until_ns` defaults to the order's expiry; candidates are only ever logged
     while the order is live, so the order's end is respected automatically.
     A skipped order (never inserted) settles as UNFILLED with no fills.
+
+    with_trades=False: a candidate counts in full if its L3 label meets the L3-only threshold.
+    with_trades=True: only its trade slices that meet the with-trades threshold count; every
+    candidate must carry `attribution` (replay with FillRecorder(attribution)).
     """
     pol = POLICIES[policy] if isinstance(policy, str) else policy
     min_rank = pol.min_rank_with_trades if with_trades else pol.min_rank_l3_only
@@ -112,16 +134,39 @@ def settle(order: SimulatedOrder, policy: str | Policy, until_ns: int | None = N
         cutoff = order.expiry_ts if until_ns is None else min(until_ns, order.expiry_ts)
         # candidates are appended in stream order; the stable sort only guards hand-built orders
         for c in sorted(order.fills, key=lambda f: f.ts_ns):
-            if c.evidence < min_rank or c.ts_ns >= cutoff:
+            if c.ts_ns >= cutoff:
                 continue
-            add = min(c.qty, order.qty - cum)
+            slices = _qualifying(c, min_rank, with_trades)
+            usable = sum((p.qty for p in slices), Decimal(0))
+            if usable <= 0:
+                continue
+            add = min(usable, order.qty - cum)
             if add <= 0:
                 break
             cum += add
-            fills.append(SettledFill(c, add))
+            fills.append(SettledFill(c, add, _allocate(slices, add)))
             first = c.ts_ns if first is None else first
             if cum == order.qty:
                 complete = c.ts_ns
                 break
     status = FillStatus.FILLED if cum == order.qty else FillStatus.PARTIAL if cum > 0 else FillStatus.UNFILLED
     return PolicyOutcome(pol.name, cum, status, first, complete, tuple(fills))
+
+
+def _qualifying(c: FillCandidate, min_rank: int, with_trades: bool) -> list[EvidencePart]:
+    if not with_trades:
+        return [EvidencePart(c.qty, c.evidence, c.trade_ids)] if c.evidence >= min_rank else []
+    if c.attribution is None:
+        raise ValueError(f"candidate {c.event_ref} has no trade attribution: replay with FillRecorder(attribution)")
+    return [p for p in c.attribution if p.evidence >= min_rank]
+
+
+def _allocate(slices: list[EvidencePart], qty: Decimal) -> tuple[EvidencePart, ...]:
+    """Split a settled quantity over qualifying slices, strongest evidence first (deterministic)."""
+    out, left = [], qty
+    for p in sorted(slices, key=lambda p: -p.evidence):
+        take = min(p.qty, left)
+        if take > 0:
+            out.append(EvidencePart(take, p.evidence, p.trade_ids))
+            left -= take
+    return tuple(out)
