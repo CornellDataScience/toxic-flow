@@ -18,7 +18,8 @@ from enum import Enum
 
 from toxicflow.kraken.book import CHECKSUM_LEVELS
 
-from .models import EndReason, Evidence, FillCandidate, OrderIntent, PlacementRequest, Side, SkipReason
+from .models import (CrossEvent, EndReason, Evidence, FillCandidate, Mechanism, OrderIntent, PlacementRequest, Side,
+                     SkipReason)
 from .queue_tracker import QueueTracker
 
 
@@ -85,6 +86,22 @@ class SimulatedOrder:
         if self.inserted_ts is None:
             return None
         return self.max_level_rank <= CHECKSUM_LEVELS
+
+    @property
+    def cross(self) -> CrossEvent | None:
+        """The first opposite-side order that came to rest at or through our price while we were
+        LIVE (the tracker only sees events of a live order). None if never crossed or never placed."""
+        return self.tracker.cross if self.tracker is not None else None
+
+    @property
+    def inconsistent_crossing(self) -> bool | None:
+        """Crossed with no LEVEL or INTERCEPT candidate up to the crossing time (§6.8): the market
+        went through our price without any reduction that could have reached us, so the crossing
+        is not explained by a sweep. None if never crossed."""
+        cross = self.cross
+        if cross is None:
+            return None
+        return not any(f.mechanism is not Mechanism.CROSS_ARRIVAL and f.ts_ns <= cross.ts_ns for f in self.fills)
 
     def start(
         self,

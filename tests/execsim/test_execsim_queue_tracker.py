@@ -92,16 +92,27 @@ def test_deletions_ahead_reach_front_without_fills():  # scenario 4
     assert (t.front_ref, t.front_ts_ns) == ((2, 0), 2000)
 
 
-@pytest.mark.parametrize(
-    ("policy", "ahead_qty", "b1_ahead"), [("keep", D("3.5"), True), ("back", D("2.0"), False)]
-)
-def test_qty_increase_ahead_follows_increase_policy(policy, ahead_qty, b1_ahead):  # scenario 3
+@pytest.mark.parametrize("policy", ["keep", "back"])
+def test_qty_increase_ahead_follows_the_book(policy):  # scenario 3, after the L3Book fix (f85989e)
+    # the book sends an increased order to the back of its level, so it leaves our ahead set
+    # under either policy: the tracker never disagrees with the book it follows
     m = standard()
     t = m.track(BUY, "100.0", increase_policy=policy)
     assert m.feed(t, bids=[order("B1", "100.0", "1.5", "modify")]) == []
-    assert t.ahead_qty == ahead_qty and ("B1" in t.ahead_ids) is b1_ahead
-    assert t.diag["ahead_increase"] == 1
-    assert_consistent(m, t)  # I3 holds under both policies (back leaves a subset)
+    assert t.ahead_qty == D("2.0") and "B1" not in t.ahead_ids
+    assert t.diag["ahead_increase"] == 1 and t.diag["ahead_requeued"] == 1
+    assert m.book.level_orders("bids", D("100.0")) == (("B2", D("2.0")), ("B1", D("1.5")))
+    assert_consistent(m, t)  # I3
+
+
+def test_increase_policy_applies_only_to_events_the_book_did_not_requeue():
+    import dataclasses
+    for policy, kept in (("keep", True), ("back", False)):
+        m = standard()
+        t = m.track(BUY, "100.0", increase_policy=policy)
+        (ev,) = m.step(bids=[order("B1", "100.0", "1.5", "modify")])
+        assert t.on_event(dataclasses.replace(ev, requeued=False)) is None  # a hand-built event
+        assert ("B1" in t.ahead_ids) is kept and t.diag["ahead_increase"] == 1
 
 
 def test_invalid_increase_policy():

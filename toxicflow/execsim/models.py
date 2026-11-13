@@ -138,6 +138,25 @@ class ReachEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class CrossEvent:
+    """The first opposite-side order that came to rest at or through our limit price while we were
+    live (buy: an ask at or below our price; sell: a bid at or above it).
+
+    From this moment the recording is no longer a world that could have contained our order: a
+    real order at our price would have traded with the arrival, or (post-only) the arrival would
+    have been rejected. What happens to the order next is decided by the crossing rule at
+    settlement (execution.CROSS_RULES); the tracker only records the fact.
+    """
+
+    ref: tuple[int | None, int]  # (position.seq, event_index) of the crossing BookEvent
+    ts_ns: int | None  # engine clock of its item
+    price: Decimal  # where the opposite order came to rest
+    qty: Decimal  # its quantity
+    ahead_qty: Decimal  # our queue ahead at that moment (non-zero: the historical book itself was crossed)
+    kind: str  # 'add', or 'modify' for a resting order re-priced through us (never a fill candidate)
+
+
+@dataclass(frozen=True, slots=True)
 class EvidencePart:
     """A slice of one candidate's volume with a single trade-attribution label (§6.5.4: a partially
     covered reduction counts only for the covered part)."""

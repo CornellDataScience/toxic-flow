@@ -181,6 +181,21 @@ than looping. `book_at` costs ~4 µs × events replayed since the last
 checkpoint, so smaller `checkpoint_every` trades memory for speed. For
 walking forward in time, `iter_book` is far cheaper than repeated `book_at`.
 
+## Execution simulator (`toxicflow/execsim`)
+
+Replays recorded L3 data to evaluate hypothetical passive orders (`join_best`, `improve_quote`,
+`quote_deeper`) with queue position, trade evidence and markouts. One command runs an experiment
+and writes it to `data/sim/<run_id>/`:
+
+```
+python scripts/run_simulation.py data/raw/l3/2026-10-18/l3_2026-10-18T04.jsonl.gz \
+    --trades auto --qty 0.001 --interval-s 10 --horizon-s 10
+```
+
+Options, the output files, the crossing rule and how to reproduce a run are in
+[docs/execsim.md](docs/execsim.md). Fills in the output are counterfactual: the recorded market
+never contained these orders.
+
 ## Troubleshooting
 
 - `CERTIFICATE_VERIFY_FAILED`: the code already uses `certifi`'s CA bundle. If

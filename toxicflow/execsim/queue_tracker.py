@@ -22,12 +22,19 @@ Diagnostic counters (`diag`) never change the queue or candidacy:
                         still ahead; ordinarily a cancel
     fifo_anomaly        the subset that is a partial reduction at the touch,
                         which would be an execution out of FIFO order (§6.5.1)
-    ahead_increase      same-price qty increase of an order ahead (row 1c)
-    ahead_requeued      an order ahead re-added or moved price (row 1d)
+    ahead_increase      same-price qty increase of an order ahead (row 1c); the book
+                        re-queues it, so it is also counted in ahead_requeued
+    ahead_requeued      an order ahead lost priority: re-added, moved price, or grew (row 1d)
     ahead_qty_mismatch  tracked qty differs from the event's prior qty (I3)
+    crossing            opposite-side orders that came to rest at or through our price
+                        (new arrivals and re-priced orders; the first one is kept as `cross`)
     cross_with_ahead    crossing arrival while orders are still ahead (no candidate)
     cross_readd         re-add of an order already resting through our price
                         (same liquidity; no second candidate)
+
+`cross` (a CrossEvent) is the first such crossing. Recording it changes neither the queue nor
+which events are candidates: what a crossing means for fills is a settlement rule
+(execution.CROSS_RULES), applied afterwards to the same logged candidates.
     events_after_invalid  events ignored after invalidation
 """
 
@@ -35,7 +42,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 from decimal import Decimal
 
-from .models import EndReason, Mechanism, ReachEvent, Side
+from .models import CrossEvent, EndReason, Mechanism, ReachEvent, Side
 from .sim_book import BookEvent
 
 INCREASE_POLICIES = ("keep", "back")
@@ -51,9 +58,12 @@ class QueueTracker:
     ):
         """`ahead` is SimL3Book.level_orders(side.book_side, price) at insertion, in priority order.
 
-        increase_policy: on a same-price qty increase of an order ahead, `keep`
-        leaves it ahead (mirrors L3Book), `back` drops it behind us (Kraken's
-        amend rule). OQ-2 is open, so both are offered.
+        increase_policy: what to do with a same-price qty increase of an order ahead that the
+        book did NOT re-queue: `keep` leaves it ahead, `back` drops it behind us. OQ-2 is now
+        answered by the data: keeping the position broke Kraken's L3 checksum, so L3Book sends
+        an increased order to the back and SimL3Book reports it as `requeued`. The tracker always
+        follows a requeued event (row 1d), whatever this setting; the setting only matters for
+        hand-built events and is kept so existing configurations still load.
         """
         if increase_policy not in INCREASE_POLICIES:
             raise ValueError(f"increase_policy must be one of {INCREASE_POLICIES}, got {increase_policy!r}")
@@ -67,6 +77,7 @@ class QueueTracker:
         self.front_ref: tuple[int | None, int] | None = None  # event that emptied the queue ahead
         self.front_ts_ns: int | None = None
         self.invalidated: EndReason | None = None  # set once the queue can no longer be followed
+        self.cross: CrossEvent | None = None  # first opposite-side order resting at or through our price
         self.diag: Counter = Counter()
 
     @property
@@ -108,6 +119,8 @@ class QueueTracker:
             return self._reach(ev, item_ts_ns)  # rows 3 to 6
         if ev.kind == "add":
             return self._cross_arrival(ev, item_ts_ns)  # row 7
+        if ev.kind == "modify":
+            self._cross_reprice(ev, item_ts_ns)  # recorded, never a candidate (row 7 is add only)
         return None
 
     def on_events(self, events: Iterable[BookEvent], item_ts_ns: int | None = None) -> list[ReachEvent]:
@@ -141,8 +154,10 @@ class QueueTracker:
         elif ev.kind == "delete" or ev.qty_after is None:
             self._leave(oid)  # row 1a
         elif ev.requeued or ev.price_after != self.price or ev.side != self.side.book_side:
-            self._leave(oid)  # row 1d: re-added or moved price, priority lost
+            self._leave(oid)  # row 1d: re-added, moved price or grew; priority lost
             self.diag["ahead_requeued"] += 1
+            if ev.price_after == self.price and ev.side == self.side.book_side and ev.qty_after > known:
+                self.diag["ahead_increase"] += 1  # row 1c as the book now applies it
         elif ev.qty_after < known:
             self.ahead_ids[oid] = ev.qty_after  # row 1b: keeps priority
             self.advanced_qty += known - ev.qty_after
@@ -193,12 +208,27 @@ class QueueTracker:
             # liquidity, already offered to us when it first arrived; never count it twice
             self.diag["cross_readd"] += 1
             return None
+        self._note_cross(ev, item_ts_ns)
         if self.ahead_ids:
             # a resting order that crosses our price means no historical order sat at it;
             # with a non-empty ahead set the state is inconsistent, so claim nothing
             self.diag["cross_with_ahead"] += 1
             return None
         return ReachEvent(_ref(ev), item_ts_ns, ev.price, ev.qty_after, Mechanism.CROSS_ARRIVAL)
+
+    def _cross_reprice(self, ev: BookEvent, item_ts_ns: int | None) -> None:
+        """An opposite-side modify that leaves an order at or through our price which was not
+        there before (a re-price, or the modify of an unknown ID that the book treats as an add)."""
+        if ev.dropped_by_truncation or ev.qty_after is None or not self._crosses(ev.price_after):
+            return
+        if ev.qty_before is not None and self._crosses(ev.price_before):
+            return  # it already rested through our price
+        self._note_cross(ev, item_ts_ns)
+
+    def _note_cross(self, ev: BookEvent, item_ts_ns: int | None) -> None:
+        self.diag["crossing"] += 1
+        if self.cross is None:
+            self.cross = CrossEvent(_ref(ev), item_ts_ns, ev.price_after, ev.qty_after, self.ahead_qty, ev.kind)
 
     def _crosses(self, opposite_price: Decimal) -> bool:
         """An opposite-side price at or through ours (ask <= our bid, bid >= our ask)."""

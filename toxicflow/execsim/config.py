@@ -33,7 +33,9 @@ class SimConfig:
     tick_size: dict[str, Decimal] = field(default_factory=dict)  # override; default 10**-price_precision
     gap_ns: int = DEFAULT_GAP_NS  # receive gap that censors (same default as validate_recording)
     warmup_ns: int = 0  # synced time required after each (re)sync before deciding
-    increase_policy: str = "keep"  # 'keep' mirrors L3Book | 'back' follows Kraken's amend rule
+    # Only for increases the book did not re-queue (hand-built events). On recordings L3Book
+    # re-queues every increase and the tracker follows it, so both values give the same result.
+    increase_policy: str = "keep"
     view_depth: int = 10  # levels per side in the strategy BookView
     audit_invariants: bool = False  # check I3 against the book after every trusted item (slow)
 

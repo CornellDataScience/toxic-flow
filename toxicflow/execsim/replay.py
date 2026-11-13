@@ -236,8 +236,10 @@ class HistoricalReplayEngine:
                 if reach is not None:
                     # the book is in its post-item state: the one the checksum just validated
                     covered = book.level_rank(ev.side, reach.event_price) <= CHECKSUM_LEVELS
+                    pos = ev.position
                     self._reaches.append(
-                        ReachRecord(o.order_id, o.strategy, s.symbol, reach, o.tracker.ahead_qty, covered)
+                        ReachRecord(o.order_id, o.strategy, s.symbol, reach, o.tracker.ahead_qty, covered,
+                                    pos.file.name if pos else None, pos.line_no if pos else None)
                     )
                     if self.on_reach is not None:
                         self.on_reach(o, reach, ev)
@@ -377,5 +379,5 @@ class HistoricalReplayEngine:
         rec = self._rec
         self._quality.append(QualityEvent(
             s.last_ts_eff, s.symbol, kind, rec.seq if rec else None, rec.recv_ns if rec else None, detail or {},
-            incident,
+            incident, rec.file.name if rec else None, rec.line_no if rec else None,
         ))

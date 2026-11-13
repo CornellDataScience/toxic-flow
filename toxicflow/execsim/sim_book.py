@@ -187,8 +187,11 @@ class SimL3Book(L3Book):
                 else:
                     self._delete(oid)
                 after = self._order_state(oid)
-                # mirrors L3Book._modify: only a same (side, price) modify keeps its place
-                kept_place = kind == "modify" and before is not None and before[:2] == (name, ev["limit_price"])
+                # mirrors L3Book._modify: a same (side, price) modify keeps its place only when the
+                # quantity does not grow; an increase goes to the back of the level (Kraken's amend
+                # rule, which the L3 checksum confirms: it hashes orders in queue order)
+                kept_place = (kind == "modify" and before is not None and before[:2] == (name, ev["limit_price"])
+                              and ev["order_qty"] <= before[3])
                 self._pending.append(
                     BookEvent(
                         kind=kind,

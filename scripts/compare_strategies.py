@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from toxicflow.execsim.config import SimConfig  # noqa: E402
+from toxicflow.execsim.execution import REPORTING_CROSS_RULE  # noqa: E402
 from toxicflow.execsim.metrics import comparison_rows, evaluate_modes, format_report  # noqa: E402
 from toxicflow.execsim.reader import file_hour, list_files  # noqa: E402
 from toxicflow.execsim.schedule import PlacementSchedule  # noqa: E402
@@ -42,7 +43,8 @@ def main() -> None:
     hour = file_hour(files[0], "l3").strftime("%Y-%m-%dT%H")
     public = files[0].parents[2] / "public" / hour[:10] / f"public_{hour}.jsonl.gz"
     trade_files = [public] if public.exists() else None
-    _, reports = evaluate_modes(cfg, strategies, schedule, files, trade_files=trade_files)
+    _, reports = evaluate_modes(cfg, strategies, schedule, files, trade_files=trade_files,
+                                cross_rule=REPORTING_CROSS_RULE)  # see scripts/run_simulation.py for saved runs
     for report in reports.values():
         print(f"{files[0].name}\n{format_report(report, markout_horizons_ns=(S, 5 * S, 10 * S))}\n")
     if trade_files is None:

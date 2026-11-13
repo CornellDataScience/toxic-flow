@@ -60,11 +60,14 @@ def test_modify_same_price_decrease_keeps_position():
     assert [oid for oid, _ in book.level_orders("bids", D("100.0"))] == ["B1", "B2"]
 
 
-def test_modify_increase_keeps_position_like_l3book():
+def test_modify_increase_goes_to_the_back_like_l3book():
+    # L3Book (f85989e): a same-price quantity increase loses priority; keeping the place broke the checksum
     book, sealer = seeded()
-    book.apply("update", sealer.update(bids=[order("B1", "100.0", "9", "modify")]))
+    last = len(book.level_orders("bids", D("100.0"))) - 1
+    assert book.apply("update", sealer.update(bids=[order("B1", "100.0", "9", "modify")])) is True
     e = only_event(book)
-    assert e.queue_index_after == 0 and not e.requeued and e.reduction == 0
+    assert (e.queue_index_before, e.queue_index_after) == (0, last) and e.requeued and e.reduction == 0
+    assert book.level_orders("bids", D("100.0"))[-1] == ("B1", D("9"))
 
 
 def test_price_changing_modify_requeues_at_new_level():

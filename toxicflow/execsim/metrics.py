@@ -38,6 +38,17 @@ FillRecorder(attribution):
               (trades.py): conservative = TRADE_CONFIRMED, balanced >= TRADE_PLAUSIBLE,
               optimistic >= L3_CROSS_ARRIVAL; TRADE_ABSENT (an unmatched reduction while the
               trade feed is healthy) never counts
+
+Crossing rules (analyze(cross_rule=...), execution.CROSS_RULES); one replay supports all three.
+An order is crossed when an opposite-side order comes to rest at or through its price before
+inserted + H. Under `stop` (and under `fill_at_cross` for the policies that do not accept a
+crossing arrival) a crossed order that was not complete by then is `resolved_by_cross`: per
+policy it is treated exactly like a censored order (outcome unknown, never a non-fill, removed
+from the point-estimate denominators, censored at the crossing time in Kaplan-Meier) but is
+counted separately (crossed_unfilled), because it is a property of the market path, not of data
+quality. Crossing is related to the outcome (it happens when the price moves through us), so
+read fill_given_placed together with its lower and upper bounds. The library default is
+`ignore` (the earlier behaviour); reports and the runner default to REPORTING_CROSS_RULE.
 """
 
 import bisect
@@ -49,7 +60,7 @@ from fractions import Fraction
 from pathlib import Path
 
 from .config import SimConfig
-from .execution import POLICY_NAMES, FillRecorder, PolicyOutcome, settle
+from .execution import CROSS_RULES, POLICY_NAMES, FillRecorder, PolicyOutcome, settle
 from .markouts import (DEFAULT_MARKOUT_HORIZONS_NS, MidSample, drift_bps, edge_bps, sample_mids, signed_markout_bps,
                        view_mid)
 from .models import EndReason, Evidence, EvidencePart, Mechanism, PlacementRequest, Side, SkipReason
@@ -175,6 +186,10 @@ class OrderObs:
     touch_qty0: Decimal | None = None
     edge_bps: Decimal | None = None  # vs the decision mid
     outcomes: dict[str, PolicyOutcome] | None = None  # per policy, placed orders only
+    cross_ts: int | None = None  # first crossing before inserted + H (policy and rule independent)
+    cross_ahead_qty: Decimal | None = None  # our queue ahead at the crossing
+    inconsistent_crossing: bool | None = None  # crossed with no reachable reduction up to then (§6.8)
+    legacy_outcomes: dict[str, PolicyOutcome] | None = None  # crossed orders: settlement under `ignore`
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +213,7 @@ class FillObs:
     markout_bps: dict[int, Decimal | None]  # horizon_ns -> signed markout; None when the future mid is missing
     markout_missing: dict[int, str | None]  # horizon_ns -> why it is missing
     qty_by_evidence: dict[str, Decimal] = None  # settled qty split by the evidence that justified it
+    after_cross: bool = False  # from an item later than the order's first crossing
 
 
 # --- summaries -------------------------------------------------------------------------------------------------
@@ -221,6 +237,8 @@ class Lifecycle:
     censored_after_horizon: int  # censor end reason at or after inserted + H (only when H < run horizon)
     placement_rate: Rate  # placed / eligible
     censored_rate: Rate  # censored / placed
+    crossed: int = 0  # placed orders crossed before inserted + H (policy and rule independent)
+    inconsistent_crossings: int = 0  # of those, with no reachable reduction up to the crossing
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +297,14 @@ class FillSummary:
     markouts: dict[int, MarkoutSummary]
     fill_qty_by_evidence: dict[str, Decimal] = None  # settled volume by evidence class
     fills_by_evidence: dict[str, int] = None  # settled fills by their strongest evidence class
+    # crossing (see the module docstring). censored_unfilled excludes crossed_unfilled; both are
+    # outside the point-estimate denominators and inside the lower / upper bounds.
+    resolved_by_cross: int = 0  # orders this policy stopped observing at a crossing, still incomplete
+    crossed_unfilled: int = 0  # of those, with nothing filled before the crossing
+    fills_after_cross: int = 0  # settled fills from items after the order's crossing (this rule)
+    legacy_filled_any: int = 0  # filled_any as it would be under `ignore`
+    legacy_fills_after_cross: int = 0  # settled fills after the crossing under `ignore`
+    legacy_first_fill_after_cross: int = 0  # orders whose first fill under `ignore` is after it
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +336,7 @@ class EvaluationReport:
     evidence_mode: str = "l3_only"
     evidence: dict[str, EvidenceStats] = field(default_factory=dict)
     attribution: dict | None = None  # TradeAttribution.stats (recording-wide), when supplied
+    cross_rule: str = "ignore"
 
 
 # --- analysis ----------------------------------------------------------------------------------------------------
@@ -319,8 +346,8 @@ def evaluate(cfg: SimConfig, strategies: Sequence[OrderPlacementStrategy], sched
              files: Sequence[Path], horizon_ns: int | None = None,
              markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
              policies: Sequence[str] = POLICY_NAMES, trade_files: Sequence[Path] | None = None,
-             evidence: str = "l3_only",
-             tolerance: MatchTolerance = DEFAULT_TOLERANCE) -> tuple[ReplayResult, EvaluationReport]:
+             evidence: str = "l3_only", tolerance: MatchTolerance = DEFAULT_TOLERANCE,
+             cross_rule: str = "ignore") -> tuple[ReplayResult, EvaluationReport]:
     """Replay with fill recording, sample the mids the markouts need (second pass), and analyze.
 
     evidence='trades' needs `trade_files` (public-stream recordings covering the same hours).
@@ -328,7 +355,7 @@ def evaluate(cfg: SimConfig, strategies: Sequence[OrderPlacementStrategy], sched
     if evidence == "trades" and not trade_files:
         raise ValueError("evidence='trades' needs trade_files")
     result, reports = evaluate_modes(cfg, strategies, schedule, files, horizon_ns, markout_horizons_ns, policies,
-                                     trade_files, tolerance, modes=(evidence,))
+                                     trade_files, tolerance, modes=(evidence,), cross_rule=cross_rule)
     return result, reports[evidence]
 
 
@@ -336,8 +363,8 @@ def evaluate_modes(cfg: SimConfig, strategies: Sequence[OrderPlacementStrategy],
                    schedule: Iterable[PlacementRequest], files: Sequence[Path], horizon_ns: int | None = None,
                    markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
                    policies: Sequence[str] = POLICY_NAMES, trade_files: Sequence[Path] | None = None,
-                   tolerance: MatchTolerance = DEFAULT_TOLERANCE,
-                   modes: Sequence[str] | None = None) -> tuple[ReplayResult, dict[str, EvaluationReport]]:
+                   tolerance: MatchTolerance = DEFAULT_TOLERANCE, modes: Sequence[str] | None = None,
+                   cross_rule: str = "ignore") -> tuple[ReplayResult, dict[str, EvaluationReport]]:
     """One replay, one mid-sampling pass, one report per evidence mode (default: 'l3_only', plus
     'trades' when `trade_files` are given), so the two modes are compared on identical orders."""
     attribution = None
@@ -348,10 +375,12 @@ def evaluate_modes(cfg: SimConfig, strategies: Sequence[OrderPlacementStrategy],
     result = eng.run(files)
     if modes is None:
         modes = EVIDENCE_MODES if attribution is not None else ("l3_only",)
-    times = required_mid_times(result, cfg, horizon_ns, markout_horizons_ns, policies, evidence=modes)
+    times = required_mid_times(result, cfg, horizon_ns, markout_horizons_ns, policies, evidence=modes,
+                               cross_rule=cross_rule)
     mids = sample_mids(cfg, times, files=files)
     reports = {m: analyze(result, cfg, mids, horizon_ns, markout_horizons_ns, policies,
-                          strategies=[s.name for s in strategies], evidence=m, attribution=attribution)
+                          strategies=[s.name for s in strategies], evidence=m, attribution=attribution,
+                          cross_rule=cross_rule)
                for m in modes}
     return result, reports
 
@@ -359,22 +388,25 @@ def evaluate_modes(cfg: SimConfig, strategies: Sequence[OrderPlacementStrategy],
 def required_mid_times(result: ReplayResult, cfg: SimConfig, horizon_ns: int | None = None,
                        markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
                        policies: Sequence[str] = POLICY_NAMES,
-                       evidence: str | Sequence[str] = "l3_only") -> set[tuple[str, int]]:
-    """(symbol, ts) pairs analyze() needs mids for: every settled fill + D (in each evidence mode),
-    and every eligible request T + D."""
+                       evidence: str | Sequence[str] = "l3_only",
+                       cross_rule: str | Sequence[str] = "ignore") -> set[tuple[str, int]]:
+    """(symbol, ts) pairs analyze() needs mids for: every settled fill + D (in each evidence mode
+    and under each crossing rule given), and every eligible request T + D."""
     times: set[tuple[str, int]] = set()
     for mode in (evidence,) if isinstance(evidence, str) else evidence:
-        report = analyze(result, cfg, None, horizon_ns, markout_horizons_ns, policies, evidence=mode)
-        times |= {(f.symbol, f.ts_ns + d) for f in report.fills for d in report.markout_horizons_ns}
-        times |= {(r.request.symbol, r.request.ts_ns + d) for r in report.requests if r.status == ELIGIBLE
-                  for d in report.markout_horizons_ns}
+        for rule in (cross_rule,) if isinstance(cross_rule, str) else cross_rule:
+            report = analyze(result, cfg, None, horizon_ns, markout_horizons_ns, policies, evidence=mode,
+                             cross_rule=rule)
+            times |= {(f.symbol, f.ts_ns + d) for f in report.fills for d in report.markout_horizons_ns}
+            times |= {(r.request.symbol, r.request.ts_ns + d) for r in report.requests if r.status == ELIGIBLE
+                      for d in report.markout_horizons_ns}
     return times
 
 
 def analyze(result: ReplayResult, cfg: SimConfig, mids: dict[tuple[str, int], MidSample] | None = None,
             horizon_ns: int | None = None, markout_horizons_ns: Sequence[int] = DEFAULT_MARKOUT_HORIZONS_NS,
             policies: Sequence[str] = POLICY_NAMES, strategies: Sequence[str] | None = None,
-            evidence: str = "l3_only", attribution=None) -> EvaluationReport:
+            evidence: str = "l3_only", attribution=None, cross_rule: str = "ignore") -> EvaluationReport:
     """Metrics for every strategy in `result` at analysis horizon H = `horizon_ns` (default: the run's).
 
     `result` must come from a replay with FillRecorder as `on_reach` (with a TradeAttribution for
@@ -383,6 +415,8 @@ def analyze(result: ReplayResult, cfg: SimConfig, mids: dict[tuple[str, int], Mi
     """
     if evidence not in EVIDENCE_MODES:
         raise ValueError(f"evidence must be one of {EVIDENCE_MODES}, got {evidence!r}")
+    if cross_rule not in CROSS_RULES:
+        raise ValueError(f"cross_rule must be one of {CROSS_RULES}, got {cross_rule!r}")
     H = cfg.horizon_ns if horizon_ns is None else horizon_ns
     if not 0 < H <= cfg.horizon_ns:
         raise ValueError(f"analysis horizon must be in (0, {cfg.horizon_ns}], got {horizon_ns}")
@@ -424,14 +458,16 @@ def analyze(result: ReplayResult, cfg: SimConfig, mids: dict[tuple[str, int], Mi
     fills: list[FillObs] = []
     for r in requests:
         for name in names:
-            obs = _order_obs(records[(r.request.request_id, name)], r, H, policies, evidence == "trades")
+            obs = _order_obs(records[(r.request.request_id, name)], r, H, policies, evidence == "trades",
+                             cross_rule)
             orders.append(obs)
             if obs.eligible and obs.stage == PLACED:
                 fills.extend(_fill_obs(obs, policies, reach_ahead, mids, horizons))
 
     baseline = _drift_baseline(requests, mids, horizons)
     report = EvaluationReport(H, cfg.latency_ns, names, tuple(policies), horizons, requests, orders, fills, {}, {},
-                              {}, {}, evidence, {}, attribution.stats if attribution is not None else None)
+                              {}, {}, evidence, {}, attribution.stats if attribution is not None else None,
+                              cross_rule)
     _summarize(report, baseline)
     report.evidence = _evidence_stats(report, records)
     return report
@@ -486,7 +522,8 @@ def _coverage_break(breaks, start: int, stop: int) -> str | None:
     return None
 
 
-def _order_obs(rec, r: RequestObs, H: int, policies: Sequence[str], with_trades: bool) -> OrderObs:
+def _order_obs(rec, r: RequestObs, H: int, policies: Sequence[str], with_trades: bool,
+               cross_rule: str = "ignore") -> OrderObs:
     eligible = r.status == ELIGIBLE
     if isinstance(rec, SkipRecord):  # SkipRecord: strategy skip (or the data gate for every strategy)
         return OrderObs(r.request, rec.strategy, eligible, SKIPPED, rec.reason)
@@ -495,10 +532,18 @@ def _order_obs(rec, r: RequestObs, H: int, policies: Sequence[str], with_trades:
         return OrderObs(r.request, o.strategy, eligible, INSERT_SKIPPED, o.skip_reason, o.order_id, o.price, o.qty)
     censored = o.end_reason.censored and o.end_ts < o.inserted_ts + H
     edge = edge_bps(o.side, o.price, r.decision_mid) if r.decision_mid is not None else None
-    outcomes = {p: settle(o, p, until_ns=o.inserted_ts + H, with_trades=with_trades) for p in policies}
+    until = o.inserted_ts + H
+    outcomes = {p: settle(o, p, until_ns=until, with_trades=with_trades, cross_rule=cross_rule) for p in policies}
+    cross = o.cross if o.cross is not None and o.cross.ts_ns < min(until, o.expiry_ts) else None
+    legacy = None
+    if cross is not None:  # what the `ignore` rule would have reported, to measure the rule's effect
+        legacy = outcomes if cross_rule == "ignore" else {
+            p: settle(o, p, until_ns=until, with_trades=with_trades, cross_rule="ignore") for p in policies}
     return OrderObs(r.request, o.strategy, eligible, PLACED, None, o.order_id, o.price, o.qty, o.inserted_ts,
                     o.end_ts, o.end_reason, censored, o.queue_ahead_qty0, o.queue_ahead_orders0, o.level_rank0,
-                    o.touch_qty0, edge, outcomes)
+                    o.touch_qty0, edge, outcomes,
+                    cross.ts_ns if cross else None, cross.ahead_qty if cross else None,
+                    o.inconsistent_crossing if cross else None, legacy)
 
 
 def _fill_obs(o: OrderObs, policies, reach_ahead, mids, horizons) -> list[FillObs]:
@@ -518,7 +563,8 @@ def _fill_obs(o: OrderObs, policies, reach_ahead, mids, horizons) -> list[FillOb
             out.append(FillObs(p, o.strategy, o.order_id, o.request.symbol, o.request.side, c.ts_ns,
                                c.ts_ns - o.inserted_ts, c.price, sf.qty, c.qty, c.mechanism, c.evidence, c.event_ref,
                                reach_ahead.get((o.order_id, c.event_ref)), marks, why,
-                               _sum_by_evidence(sf.by_evidence)))
+                               _sum_by_evidence(sf.by_evidence),
+                               o.cross_ts is not None and c.ts_ns > o.cross_ts))
     return out
 
 
@@ -588,6 +634,8 @@ def _summarize(report: EvaluationReport, baseline) -> None:
             censored_after_horizon=sum(o.end_reason.censored and not o.censored for o in placed),
             placement_rate=Rate(len(placed), len(obs)),
             censored_rate=Rate(len(censored), len(placed)),
+            crossed=sum(o.cross_ts is not None for o in placed),
+            inconsistent_crossings=sum(bool(o.inconsistent_crossing) for o in placed),
         )
         report.queue[name] = QueueStats(
             ahead_qty=Dist.of(o.queue_ahead_qty0 for o in placed),
@@ -610,24 +658,35 @@ def _fill_summary(report, name, p, obs, placed, common, fills, baseline) -> Fill
     def full(o):
         return o.outcomes[p].filled_qty == o.qty
 
+    def resolved(o):  # this policy stopped observing at a crossing, order still incomplete
+        return o.outcomes[p].resolved_by_cross
+
+    def cut(o):  # the outcome is not observed to the horizon: data censoring or a crossing
+        return o.censored or resolved(o)
+
     any_ = [o for o in placed if filled(o)]
     full_ = [o for o in placed if full(o)]
-    cens_unf = [o for o in placed if o.censored and not filled(o)]
-    full_und = [o for o in placed if o.censored and not full(o)]
+    cross_unf = [o for o in placed if resolved(o) and not filled(o)]
+    cens_unf = [o for o in placed if o.censored and not resolved(o) and not filled(o)]
+    unknown = len(cens_unf) + len(cross_unf)
+    full_und = [o for o in placed if cut(o) and not full(o)]
     obs_common = [o for o in obs if o.request.request_id in common]
     common_any = sum(o.stage == PLACED and filled(o) for o in obs_common)
-    common_cu = sum(o.stage == PLACED and o.censored and not filled(o) for o in obs_common)
+    common_cu = sum(o.stage == PLACED and cut(o) and not filled(o) for o in obs_common)
+    crossed = [o for o in placed if o.legacy_outcomes is not None]
+    legacy = [(o, o.legacy_outcomes[p]) for o in crossed]
 
     def bucket_rates(key, buckets):
         groups: dict[str, list[OrderObs]] = defaultdict(list)
         for o in placed:
             groups[_bucket(key(o), buckets)].append(o)
         return {label: Rate(sum(filled(o) for o in groups[label]),
-                            sum(not (o.censored and not filled(o)) for o in groups[label]))
+                            sum(not (cut(o) and not filled(o)) for o in groups[label]))
                 for _, _, label in buckets if label in groups}
 
     km = kaplan_meier(
         (o.outcomes[p].first_fill_ts - o.inserted_ts, True) if filled(o)
+        else (o.outcomes[p].cross_ts - o.inserted_ts, False) if resolved(o)
         else (o.end_ts - o.inserted_ts, False) if o.censored
         else (H, False)
         for o in placed)
@@ -635,12 +694,12 @@ def _fill_summary(report, name, p, obs, placed, common, fills, baseline) -> Fill
         strategy=name, policy=p,
         filled_any=len(any_), filled_full=len(full_),
         partial=sum(0 < o.outcomes[p].filled_qty < o.qty for o in placed),
-        unfilled_observed=sum(not o.censored and not filled(o) for o in placed),
+        unfilled_observed=sum(not cut(o) and not filled(o) for o in placed),
         censored_unfilled=len(cens_unf), full_undetermined=len(full_und),
-        fill_given_placed=Rate(len(any_), len(placed) - len(cens_unf)),
+        fill_given_placed=Rate(len(any_), len(placed) - unknown),
         fill_given_placed_lower=Rate(len(any_), len(placed)),
-        fill_given_placed_upper=Rate(len(any_) + len(cens_unf), len(placed)),
-        fill_per_opportunity=Rate(len(any_), len(obs) - len(cens_unf)),
+        fill_given_placed_upper=Rate(len(any_) + unknown, len(placed)),
+        fill_per_opportunity=Rate(len(any_), len(obs) - unknown),
         fill_common_support=Rate(common_any, len(obs_common) - common_cu),
         full_fill_given_placed=Rate(len(full_), len(placed) - len(full_und)),
         full_fill_per_opportunity=Rate(len(full_), len(obs) - len(full_und)),
@@ -655,6 +714,13 @@ def _fill_summary(report, name, p, obs, placed, common, fills, baseline) -> Fill
         markouts={d: _markout_summary(d, fills, baseline) for d in report.markout_horizons_ns},
         fill_qty_by_evidence=_merge_qty(f.qty_by_evidence for f in fills),
         fills_by_evidence=_counts(max(f.qty_by_evidence, key=lambda k: Evidence[k]) for f in fills),
+        resolved_by_cross=sum(resolved(o) for o in placed), crossed_unfilled=len(cross_unf),
+        fills_after_cross=sum(f.after_cross for f in fills),
+        legacy_filled_any=len(any_) + sum(lo.filled_qty > 0 and not filled(o) for o, lo in legacy)
+        - sum(lo.filled_qty == 0 and filled(o) for o, lo in legacy),
+        legacy_fills_after_cross=sum(sf.candidate.ts_ns > o.cross_ts for o, lo in legacy for sf in lo.fills),
+        legacy_first_fill_after_cross=sum(lo.first_fill_ts is not None and lo.first_fill_ts > o.cross_ts
+                                          for o, lo in legacy),
     )
 
 
@@ -728,7 +794,7 @@ def comparison_rows(report: EvaluationReport, policy: str) -> list[dict]:
         lc, q, s = report.lifecycle[name], report.queue[name], report.summary[(name, policy)]
         row = {
             "strategy": name, "policy": policy, "evidence_mode": report.evidence_mode,
-            "horizon_ns": report.horizon_ns,
+            "cross_rule": report.cross_rule, "horizon_ns": report.horizon_ns,
             "eligible": lc.eligible, "strategy_skips": lc.strategy_skips, "insertion_skips": lc.insertion_skips,
             "placed": lc.placed, "censored": lc.censored, "placement_rate": lc.placement_rate,
             "filled_any": s.filled_any, "filled_full": s.filled_full,
@@ -738,6 +804,12 @@ def comparison_rows(report: EvaluationReport, policy: str) -> list[dict]:
             "median_ttf_ns": s.time_to_first_fill_ns.median, "median_ahead_qty0": q.ahead_qty.median,
             "median_ahead_orders0": q.ahead_orders.median, "mean_edge_bps": q.edge_bps.mean, "n_fills": s.n_fills,
             "fill_qty_by_evidence": s.fill_qty_by_evidence,
+            "fill_given_placed_lower": s.fill_given_placed_lower,
+            "fill_given_placed_upper": s.fill_given_placed_upper,
+            "crossed": lc.crossed, "resolved_by_cross": s.resolved_by_cross,
+            "crossed_unfilled": s.crossed_unfilled, "fills_after_cross": s.fills_after_cross,
+            "legacy_filled_any": s.legacy_filled_any, "legacy_fills_after_cross": s.legacy_fills_after_cross,
+            "legacy_first_fill_after_cross": s.legacy_first_fill_after_cross,
         }
         for d, m in s.markouts.items():
             row[f"markout_{_label(d)}_n"] = m.n_valid
@@ -752,8 +824,8 @@ def format_report(report: EvaluationReport, markout_horizons_ns: Sequence[int] |
     """Plain-text summary: request accounting, lifecycle, then one fill/markout table per policy."""
     rc = report.request_counts
     shown = tuple(markout_horizons_ns or report.markout_horizons_ns)
-    lines = [f"evidence {report.evidence_mode}, horizon {report.horizon_ns / 1e9:g}s, "
-             f"latency {report.latency_ns / 1e6:g}ms",
+    lines = [f"evidence {report.evidence_mode}, cross rule {report.cross_rule}, "
+             f"horizon {report.horizon_ns / 1e9:g}s, latency {report.latency_ns / 1e6:g}ms",
              f"requests {rc['total']}: eligible {rc['eligible']}, common support {rc['common_support']}, "
              f"data gate {rc['data_gate']}, coverage {rc['coverage']}", "",
              f"{'strategy':<16}{'eligible':>9}{'skips':>7}{'ins.skip':>9}{'placed':>8}{'place rate':>11}"
@@ -764,6 +836,13 @@ def format_report(report: EvaluationReport, markout_horizons_ns: Sequence[int] |
         lines.append(f"{name:<16}{lc.eligible:>9}{lc.strategy_skips:>7}{lc.insertion_skips:>9}{lc.placed:>8}"
                      f"{_f(pr):>11}{lc.expired:>9}{lc.censored:>9}  "
                      f"{ {**lc.strategy_skip_reasons, **lc.insertion_skip_reasons} or ''}")
+    lines += ["", "crossed: an opposite-side order came to rest at or through our price before H "
+              "(unexplained: no reduction could have reached us by then)",
+              f"{'strategy':<16}{'placed':>8}{'crossed':>9}{'share':>8}{'unexplained':>13}"]
+    for name in report.strategies:
+        lc = report.lifecycle[name]
+        lines.append(f"{name:<16}{lc.placed:>8}{lc.crossed:>9}{_f(Rate(lc.crossed, lc.placed).value):>8}"
+                     f"{lc.inconsistent_crossings:>13}")
     lines += ["", "candidate volume by evidence (eligible placed orders, before H; n candidates)"]
     for name in report.strategies:
         ev = report.evidence.get(name)
@@ -787,10 +866,27 @@ def format_report(report: EvaluationReport, markout_horizons_ns: Sequence[int] |
                 m = s.markouts[d]
                 row += f"{f'{m.n_valid} / {_f(m.mean)} / {_f(m.median)} / {_f(m.frac_negative.value)}':>32}"
             lines.append(row)
+        lines.append(f"  crossing under this policy ({report.cross_rule}); P(f|placed) bounds count every "
+                     "unknown outcome as a non-fill / as a fill")
+        for name in report.strategies:
+            s = report.summary[(name, p)]
+            lines.append(
+                f"  {name:<14} unknown at crossing {s.resolved_by_cross} (unfilled {s.crossed_unfilled}), "
+                f"censored unfilled {s.censored_unfilled}, bounds [{_f(s.fill_given_placed_lower.value)}, "
+                f"{_f(s.fill_given_placed_upper.value)}]; 'ignore' would report {s.legacy_filled_any} filled, "
+                f"{s.legacy_first_fill_after_cross} first filled after the crossing "
+                f"({s.legacy_fills_after_cross} fills after it)")
     caveat = ("L3-only policies bracket the truth (conservative is always 0)." if report.evidence_mode == "l3_only"
               else "Trade mode: conservative = same-µs trade matches only; policies remain bounds.")
+    cross_note = {
+        "ignore": "Cross rule ignore (legacy): a crossed order keeps resting and later trades count.",
+        "stop": "Cross rule stop: nothing after an order's crossing item counts; its outcome is unknown, not a non-fill.",
+        "fill_at_cross": "Cross rule fill_at_cross: optimistic counts the crossing arrival and what follows; "
+                         "conservative and balanced stop at the crossing.",
+    }[report.cross_rule]
     lines += ["", "Markouts in bps vs the fill price, positive = favorable. Descriptive only: no significance "
-              f"or profitability claim. {caveat}"]
+              f"or profitability claim. {caveat}", cross_note,
+              "Fills are counterfactual: the recorded market never contained these orders."]
     return "\n".join(lines)
 
 
