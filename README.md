@@ -196,6 +196,42 @@ Options, the output files, the crossing rule and how to reproduce a run are in
 [docs/execsim.md](docs/execsim.md). Fills in the output are counterfactual: the recorded market
 never contained these orders.
 
+### Markout curves (`scripts/markout_report.py`)
+
+How much of the spread a passive fill keeps, and for how long. Every fill's PnL splits into
+**spread** (what it earned on arrival: half the bid-ask spread for an order at the touch),
+**adverse selection** (how far the mid then moved against it) and a **fee** (not modeled yet,
+shown as 0). The markout curve is the mean adverse move at log-spaced times after the fill.
+With toxic flow it slopes down: after a buy, the price falls. Where it crosses the horizontal
+−half-spread line, the average fill has given back the whole spread. That crossing is the
+**breakeven horizon**.
+
+```
+python scripts/markout_report.py data/raw/l3/2026-10-18/l3_2026-10-18T04.jsonl.gz \
+    --trades auto --qty 0.001 --interval-s 1
+```
+
+The same hypothetical orders (`--strategy`, default `join_best`) are filled two ways:
+
+- **queue_aware**: execsim's queue tracker. The order joins the back of the real queue and only
+  fills once everything ahead of it is gone (`--policy`, default `balanced`).
+- **naive**: filled in full the first time the price touches it: a trade at or through our
+  price on our side, or an opposite order resting at or through it. Needs `--trades`.
+
+Output in `data/reports/markouts/<run>/`: `markout_curve.png`, `markout_distribution.png`
+(per-fill percentiles and a histogram), `loss_concentration.png` (share of the loss from the
+worst X% of fills), the tables `pnl_split.csv`, `curve.csv`, `concentration.csv`,
+`worst_fills_profile.csv` and `fill_rates.csv`, per-fill rows in `fills.csv` (for modeling),
+and `summary.md`. The definitions are in `toxicflow/execsim/markout_curve.py`. Some points to
+keep in mind when reading the numbers:
+
+- The mid at execution includes our own order. The recorded book never contained it, so when
+  the real queue at our price empties, the recorded mid can sit past our price. With our
+  order in the book, it is the touch.
+- Means are quantity-weighted (PnL per unit traded). Standard errors are clustered by fill
+  time, because one market event often fills many overlapping hypothetical orders.
+- The curve keeps only fills with a mid at every horizon, so every point averages the same fills.
+
 ## Troubleshooting
 
 - `CERTIFICATE_VERIFY_FAILED`: the code already uses `certifi`'s CA bundle. If
